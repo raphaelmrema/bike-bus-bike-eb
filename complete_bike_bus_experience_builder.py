@@ -1302,6 +1302,7 @@ async def get_ui():
             .leg-bike { background: #27ae60; }
             .leg-transit { background: #3498db; }
             .leg-text { flex: 1; font-size: 0.8em; }
+            .legs-preview { margin-top: 12px; font-size: 0.85em; }
         </style>
     </head>
     <body>
@@ -1785,5 +1786,4 @@ if __name__ == "__main__":
         reload=False,
         access_log=True,
         log_level="info"
-    )s-preview { margin-top: 12px; font-size: 0.85em; }
-            .leg
+    )
