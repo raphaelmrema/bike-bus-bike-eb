@@ -1,0 +1,194 @@
+📦 COMPLETE BIKE-BUS-BIKE EXPERIENCE BUILDER DEPLOYMENT PACKAGE
+==================================================================
+
+🎯 This package contains everything you need to deploy your bike-bus-bike route planner to work with ArcGIS Experience Builder. No code editing required!
+
+📁 FILE STRUCTURE:
+------------------
+bike-bus-eb-deployment/
+├── complete_bike_bus_experience_builder.py  # ✅ Main application (already provided above)
+├── requirements.txt                         # Python dependencies
+├── Procfile                                 # For cloud deployment
+├── runtime.txt                              # Python version
+├── Dockerfile                               # Docker deployment (optional)
+├── .env.template                            # Environment variables template
+├── README.md                                # Deployment instructions
+└── deploy_to_railway.md                     # Railway deployment guide
+
+==================================================================
+FILE 1: requirements.txt
+==================================================================
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+requests==2.31.0
+pandas==2.1.3
+python-multipart==0.0.6
+jinja2==3.1.2
+
+==================================================================
+FILE 2: Procfile
+==================================================================
+web: uvicorn complete_bike_bus_experience_builder:app --host 0.0.0.0 --port $PORT
+
+==================================================================
+FILE 3: runtime.txt
+==================================================================
+python-3.11.9
+
+==================================================================
+FILE 4: Dockerfile (Optional - for Docker deployment)
+==================================================================
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application
+COPY complete_bike_bus_experience_builder.py .
+
+# Expose port
+EXPOSE 8000
+
+# Set environment variables
+ENV PORT=8000
+ENV PYTHONUNBUFFERED=1
+
+# Run application
+CMD ["uvicorn", "complete_bike_bus_experience_builder:app", "--host", "0.0.0.0", "--port", "8000"]
+
+==================================================================
+FILE 5: .env.template
+==================================================================
+# Copy this file to .env and fill in your actual values
+
+# REQUIRED: Your Google Maps API Key
+GOOGLE_MAPS_API_KEY=your_google_maps_api_key_here
+
+# OPTIONAL: Allowed CORS origins (leave as-is for most deployments)
+ALLOWED_ORIGINS=https://experience.arcgis.com,https://*.maps.arcgis.com,http://localhost:*
+
+# OPTIONAL: Port (will be set automatically by cloud providers)
+PORT=8000
+
+==================================================================
+FILE 6: README.md
+==================================================================
+# 🚴‍♂️🚌🚴‍♀️ Bike-Bus-Bike Route Planner for ArcGIS Experience Builder
+
+Complete multimodal transportation planning tool with real-time GTFS integration, designed for seamless embedding in ArcGIS Experience Builder.
+
+## Features
+
+- ✅ **Bike-Bus-Bike Analysis**: Optimal multimodal routing
+- ✅ **Real-time GTFS Data**: Live JTA transit information
+- ✅ **Google Maps Integration**: Transit + bicycling directions
+- ✅ **Smart Fallback**: Automatically chooses best routing strategy
+- ✅ **Experience Builder Ready**: CORS-enabled for iframe embedding
+- ✅ **Cloud Deployment**: Works on Railway, Heroku, AWS, Google Cloud
+
+## Quick Start
+
+### 1. Deploy to Railway.app (Recommended)
+
+1. Create account at [railway.app](https://railway.app)
+2. Create new project → "Deploy from GitHub repo"
+3. Upload these files or connect your GitHub repo
+4. Set environment variable: `GOOGLE_MAPS_API_KEY` = your actual key
+5. Deploy and copy your app URL
+
+### 2. Use in Experience Builder
+
+1. Open ArcGIS Experience Builder
+2. Create new experience or edit existing
+3. Add "Map" widget for main map
+4. Add "Embed" widget for the route planner
+5. Set Embed widget URL to your deployed app URL
+6. Enable "Allow interaction" in Embed settings
+7. Publish your experience
+
+## API Endpoints
+
+- `GET /` - Embedded UI for Experience Builder
+- `GET /api/health` - System health check
+- `GET /api/analyze` - Route analysis endpoint
+- `GET /api/stops` - Nearby transit stops
+
+## Environment Variables
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `GOOGLE_MAPS_API_KEY` | Yes | Your Google Maps API key |
+| `ALLOWED_ORIGINS` | No | CORS origins (auto-configured) |
+| `PORT` | No | Server port (auto-set by host) |
+
+## Support
+
+- Check `/api/health` for system status
+- View `/docs` for API documentation
+- Monitor logs for detailed error information
+
+## Architecture
+
+```
+Experience Builder → Embed Widget → Your Deployed API → Google Maps + GTFS
+```
+
+This architecture provides maximum compatibility and easy maintenance.
+
+==================================================================
+FILE 7: deploy_to_railway.md
+==================================================================
+# 🚀 Railway.app Deployment Guide
+
+## Step-by-Step Deployment
+
+### 1. Prepare Your Files
+
+Create a folder called `bike-bus-eb-deployment` with these files:
+- `complete_bike_bus_experience_builder.py` (main application)
+- `requirements.txt`
+- `Procfile`
+- `runtime.txt`
+- `.env` (copy from .env.template and fill in your API key)
+
+### 2. Create Railway Account
+
+1. Go to [railway.app](https://railway.app)
+2. Click "Start a New Project"
+3. Sign up with GitHub (recommended) or email
+
+### 3. Create New Project
+
+**Option A: From GitHub (Recommended)**
+1. Click "Deploy from GitHub repo"
+2. Connect your GitHub account
+3. Upload your files to a GitHub repo
+4. Select the repo in Railway
+
+**Option B: Direct Upload**
+1. Click "Deploy from template"
+2. Choose "Blank template"
+3. Use Railway CLI to upload files:
+   ```bash
+   npm install -g @railway/cli
+   railway login
+   railway link
+   railway up
+   ```
+
+### 4. Set Environment Variables
+
+1. In Railway dashboard → Your project
+2. Go to "Variables" tab
+3. Add variable:
+   - Name: `GOOGLE_MAPS_API_KEY`
+   - Value: Your actual Google Maps API key
+
+### 5. Deploy and Test
+
+1. Railway automatically builds and deploys
+2. Copy your app URL (like `https://bike-bus-api-production.up.railway.app`)
+3.
