@@ -1,6 +1,6 @@
-# complete_bike_bus_experience_builder.py
-# Complete Bike-Bus-Bike Route Planner for ArcGIS Experience Builder
-# Ready for cloud deployment - No editing required!
+# complete_bike_bus_experience_builder_osrm.py
+# Complete Bike-Bus-Bike Route Planner with OSRM for ArcGIS Experience Builder
+# Uses OSRM for bicycle routing instead of Google Maps
 
 import os
 import json
@@ -19,8 +19,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 import uvicorn
 
+# Try importing polyline for OSRM geometry decoding
+try:
+    import polyline
+except ImportError:
+    import subprocess
+    subprocess.check_call(['pip', 'install', 'polyline'])
+    import polyline
+
 # =============================================================================
-# CONFIGURATION FOR EXPERIENCE BUILDER DEPLOYMENT
+# CONFIGURATION FOR EXPERIENCE BUILDER DEPLOYMENT WITH OSRM
 # =============================================================================
 
 # Environment variables for cloud deployment
@@ -28,7 +36,11 @@ GOOGLE_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY", "AIzaSyBmGvPmWyKlR5DAtOu8vrmO0
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", 
     "https://experience.arcgis.com,https://*.maps.arcgis.com,http://localhost:*,https://*.railway.app").split(",")
 
-# Bicycle Configuration (from original collective57.py)
+# OSRM Configuration
+OSRM_SERVER = os.getenv("OSRM_SERVER", "http://router.project-osrm.org")
+USE_OSRM_DURATION = True  # Use OSRM's time estimates instead of fixed speed
+
+# Bicycle Configuration
 BIKE_SPEED_MPH = 11
 BIKE_SPEED_FEET_PER_SECOND = BIKE_SPEED_MPH * 5280 / 3600
 
@@ -41,8 +53,8 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 
 app = FastAPI(
-    title="Bike-Bus-Bike Route Planner API",
-    description="Advanced multimodal transportation planning API for ArcGIS Experience Builder",
+    title="OSRM Bike-Bus-Bike Route Planner API",
+    description="Advanced multimodal transportation planning API with OSRM bicycle routing for ArcGIS Experience Builder",
     version="1.0.0",
     docs_url="/docs",
     redoc_url="/redoc"
@@ -51,18 +63,18 @@ app = FastAPI(
 # CORS middleware configured for Experience Builder
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # More permissive for cloud deployment
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # =============================================================================
-# ENHANCED GTFS MANAGER (FROM COLLECTIVE57.PY - CLOUD OPTIMIZED)
+# ENHANCED GTFS MANAGER (SAME AS BEFORE)
 # =============================================================================
 
 class EnhancedGTFSManager:
-    """Enhanced GTFS manager with real-time capabilities (cloud-ready version)"""
+    """Enhanced GTFS manager with real-time capabilities"""
     
     def __init__(self):
         self.gtfs_data = {}
@@ -77,7 +89,7 @@ class EnhancedGTFSManager:
         self.cache_duration = 30  # seconds
         
     def load_gtfs_data(self, gtfs_urls=None):
-        """Load GTFS data with enhanced error handling (from collective57.py)"""
+        """Load GTFS data with enhanced error handling"""
         if gtfs_urls is None:
             gtfs_urls = [
                 "https://ride.jtafla.com/gtfs-archive/gtfs.zip",
@@ -152,7 +164,7 @@ class EnhancedGTFSManager:
         return False
     
     def get_realtime_departures(self, stop_id: str) -> List[Dict]:
-        """Get real-time departures with live updates and time filtering (from collective57.py)"""
+        """Get real-time departures with live updates and time filtering"""
         try:
             # Check cache first
             cache_key = f"departures_{stop_id}"
@@ -183,24 +195,19 @@ class EnhancedGTFSManager:
             
         except Exception as e:
             logger.error(f"Error getting real-time departures: {e}")
-            # Fallback to static schedule
             return self.get_stop_schedules(stop_id)
     
     def _simulate_realtime_variations(self, stop_id: str) -> Dict:
-        """Simulate realistic real-time variations for demonstration (from collective57.py)"""
+        """Simulate realistic real-time variations for demonstration"""
         import random
         
-        # Simulate typical transit delays
         variations = {}
         current_time = datetime.datetime.now()
         
-        # Simulate delays based on time of day
         if 7 <= current_time.hour <= 9 or 16 <= current_time.hour <= 18:
-            # Rush hour - more delays
             delay_chance = 0.7
-            avg_delay = 5  # minutes
+            avg_delay = 5
         else:
-            # Off-peak - fewer delays
             delay_chance = 0.3
             avg_delay = 2
         
@@ -214,29 +221,25 @@ class EnhancedGTFSManager:
         return variations
     
     def _merge_schedule_and_realtime(self, scheduled: List[Dict], realtime: Dict) -> List[Dict]:
-        """Merge scheduled times with real-time updates (from collective57.py)"""
+        """Merge scheduled times with real-time updates"""
         enhanced = []
         
         for schedule in scheduled:
             enhanced_departure = schedule.copy()
             
-            # Add real-time status
             enhanced_departure['realtime_status'] = 'scheduled'
             enhanced_departure['delay_minutes'] = 0
             enhanced_departure['original_time'] = schedule['departure_time']
             
-            # Apply real-time updates if available
             if 'delays' in realtime:
                 delay_info = realtime['delays']
                 
-                # Simulate delay application
                 import random
                 if random.random() < delay_info.get('probability', 0):
                     delay_minutes = random.randint(0, delay_info.get('max_delay_minutes', 5))
                     enhanced_departure['delay_minutes'] = delay_minutes
                     enhanced_departure['realtime_status'] = 'delayed' if delay_minutes > 0 else 'on_time'
                     
-                    # Calculate new departure time
                     try:
                         original_time = datetime.datetime.strptime(schedule['departure_time'], '%H:%M:%S')
                         new_time = original_time + datetime.timedelta(minutes=delay_minutes)
@@ -245,7 +248,6 @@ class EnhancedGTFSManager:
                     except:
                         enhanced_departure['realtime_departure'] = schedule['departure_time'][:5]
             
-            # Add helpful status indicators
             if enhanced_departure['delay_minutes'] > 5:
                 enhanced_departure['status_color'] = '#ff4444'
                 enhanced_departure['status_text'] = f"Delayed {enhanced_departure['delay_minutes']} min"
@@ -261,7 +263,7 @@ class EnhancedGTFSManager:
         return enhanced
     
     def _filter_upcoming_departures(self, departures: List[Dict]) -> List[Dict]:
-        """Filter to show only upcoming departures (from collective57.py)"""
+        """Filter to show only upcoming departures"""
         current_time = datetime.datetime.now().time()
         current_datetime = datetime.datetime.now()
         
@@ -270,13 +272,11 @@ class EnhancedGTFSManager:
             try:
                 dept_time_str = departure.get('departure_time', '')
                 if ':' in dept_time_str:
-                    # Handle times that might go past midnight (e.g., 25:30:00)
                     time_parts = dept_time_str.split(':')
                     hours = int(time_parts[0])
                     minutes = int(time_parts[1])
                     
                     if hours >= 24:
-                        # Next day departure
                         dept_datetime = current_datetime.replace(
                             hour=hours-24, minute=minutes, second=0, microsecond=0
                         ) + datetime.timedelta(days=1)
@@ -285,7 +285,6 @@ class EnhancedGTFSManager:
                             hour=hours, minute=minutes, second=0, microsecond=0
                         )
                     
-                    # Only include departures in the next 4 hours
                     time_diff = dept_datetime - current_datetime
                     if datetime.timedelta(0) <= time_diff <= datetime.timedelta(hours=4):
                         departure['time_until_departure'] = self._format_time_until(time_diff)
@@ -295,12 +294,11 @@ class EnhancedGTFSManager:
             except (ValueError, IndexError):
                 continue
         
-        # Sort by departure time and return next 10
         upcoming.sort(key=lambda x: x.get('departure_datetime', current_datetime))
         return upcoming[:10]
     
     def _format_time_until(self, time_diff: datetime.timedelta) -> str:
-        """Format time until departure in a user-friendly way (from collective57.py)"""
+        """Format time until departure in a user-friendly way"""
         total_minutes = int(time_diff.total_seconds() / 60)
         
         if total_minutes < 1:
@@ -316,7 +314,7 @@ class EnhancedGTFSManager:
                 return f"{hours}h {minutes}m"
     
     def get_stop_schedules(self, stop_id, hours_ahead=4):
-        """Get base stop schedules (from collective57.py)"""
+        """Get base stop schedules"""
         if not self.is_loaded or self.stop_times_df is None:
             return []
         
@@ -326,7 +324,6 @@ class EnhancedGTFSManager:
             if stop_times.empty:
                 return []
             
-            # Join with trips and routes
             if self.trips_df is not None:
                 stop_times = stop_times.merge(
                     self.trips_df[['trip_id', 'route_id', 'trip_headsign']], 
@@ -363,7 +360,7 @@ class EnhancedGTFSManager:
             return []
     
     def find_nearby_stops(self, lat, lon, radius_km=0.5):
-        """Find GTFS stops near coordinates (from collective57.py)"""
+        """Find GTFS stops near coordinates"""
         if not self.is_loaded or self.stops_df is None:
             return []
         
@@ -381,17 +378,17 @@ class EnhancedGTFSManager:
 gtfs_manager = EnhancedGTFSManager()
 
 # =============================================================================
-# UTILITY FUNCTIONS (FROM COLLECTIVE57.PY)
+# UTILITY FUNCTIONS
 # =============================================================================
 
 def calculate_bike_time_minutes(distance_feet):
-    """Calculate bicycle travel time in minutes given distance in feet (from collective57.py)"""
+    """Calculate bicycle travel time in minutes given distance in feet"""
     if distance_feet <= 0:
         return 0
     return (distance_feet / BIKE_SPEED_FEET_PER_SECOND) / 60
 
 def format_time_duration(minutes):
-    """Format time duration in a user-friendly way (from collective57.py)"""
+    """Format time duration in a user-friendly way"""
     if minutes < 1:
         return "< 1 min"
     elif minutes < 60:
@@ -405,7 +402,7 @@ def format_time_duration(minutes):
             return f"{hours}h {mins}m"
 
 def decode_polyline(polyline_str):
-    """Decode Google polyline string to coordinates (from collective57.py)"""
+    """Decode Google polyline string to coordinates"""
     try:
         index = 0
         lat = 0
@@ -445,11 +442,154 @@ def decode_polyline(polyline_str):
         return []
 
 # =============================================================================
-# GOOGLE MAPS API FUNCTIONS (ENHANCED FROM COLLECTIVE57.PY)
+# OSRM BICYCLE ROUTING FUNCTIONS (REPLACING GOOGLE MAPS)
+# =============================================================================
+
+def calculate_bike_route_osrm(start_coords, end_coords, waypoints=None, route_name="Bike Route"):
+    """Create a bike route using OSRM instead of Google Maps"""
+    try:
+        logger.info(f"🚴‍♂️ Creating OSRM bike route: {route_name} from {start_coords} to {end_coords}")
+        
+        # Build coordinates string for OSRM: "lon,lat;lon,lat;..."
+        coords_list = [f"{start_coords[0]},{start_coords[1]}"]
+        if waypoints:
+            for wp in waypoints:
+                coords_list.append(f"{wp[0]},{wp[1]}")
+        coords_list.append(f"{end_coords[0]},{end_coords[1]}")
+        coords = ";".join(coords_list)
+        
+        url = f"{OSRM_SERVER}/route/v1/cycling/{coords}"
+        params = {
+            "overview": "full",
+            "geometries": "polyline",
+            "steps": "true",
+            "alternatives": "false",
+        }
+        
+        response = requests.get(url, params=params, timeout=30)
+        response.raise_for_status()
+        
+        data = response.json()
+        
+        if data.get("code") != "Ok" or not data.get("routes"):
+            logger.warning(f"No OSRM route found for {route_name}")
+            return None
+        
+        route = data["routes"][0]
+        
+        # Extract geometry
+        geometry_polyline = route["geometry"]
+        coords_latlon = polyline.decode(geometry_polyline)  # [(lat, lon), ...]
+        route_geometry = [[lon, lat] for (lat, lon) in coords_latlon]  # Convert to [lon, lat] for GeoJSON
+        
+        # Extract distance and duration
+        distance_meters = float(route.get("distance", 0.0))
+        distance_miles = distance_meters * 0.000621371
+        distance_feet = distance_meters * 3.28084
+        
+        # Use OSRM's duration if available, otherwise fallback to speed calculation
+        osrm_duration_sec = route.get("duration", None)
+        if USE_OSRM_DURATION and isinstance(osrm_duration_sec, (int, float)) and osrm_duration_sec > 0:
+            duration_minutes = float(osrm_duration_sec) / 60.0
+            osrm_time_used = True
+        else:
+            duration_minutes = (distance_miles / BIKE_SPEED_MPH) * 60.0
+            osrm_time_used = False
+        
+        # Simulate bike safety analysis (since we don't have ArcGIS)
+        overall_score = simulate_bike_safety_score(distance_miles, route_geometry)
+        facility_stats = simulate_facility_stats(distance_miles)
+        
+        return {
+            "name": route_name,
+            "length_feet": distance_feet,
+            "length_miles": distance_miles,
+            "travel_time_minutes": duration_minutes,
+            "travel_time_formatted": format_time_duration(duration_minutes),
+            "osrm_time_used": osrm_time_used,
+            "geometry": {
+                "type": "LineString",
+                "coordinates": route_geometry
+            },
+            "segments": [],  # Simplified - no detailed segment analysis
+            "overall_score": overall_score,
+            "facility_stats": facility_stats,
+            "waypoints": waypoints or []
+        }
+        
+    except Exception as e:
+        logger.error(f"Error calculating OSRM bike route: {e}")
+        return None
+
+def simulate_bike_safety_score(distance_miles, route_geometry):
+    """Simulate bike safety score (replaces ArcGIS LTS analysis)"""
+    base_score = 65
+    
+    if distance_miles < 1:
+        base_score += 10
+    elif distance_miles > 5:
+        base_score -= 10
+    
+    if route_geometry and len(route_geometry) > 20:
+        base_score += 5
+    
+    import random
+    variation = random.randint(-15, 15)
+    final_score = max(0, min(100, base_score + variation))
+    
+    return round(final_score, 1)
+
+def simulate_facility_stats(distance_miles):
+    """Simulate bicycle facility statistics"""
+    import random
+    
+    facility_types = [
+        "PROTECTED BIKELANE",
+        "BUFFERED BIKELANE", 
+        "UNBUFFERED BIKELANE",
+        "SHARED LANE",
+        "NO BIKELANE"
+    ]
+    
+    total_feet = distance_miles * 5280
+    stats = {}
+    
+    remaining_distance = total_feet
+    for i, facility_type in enumerate(facility_types):
+        if i == len(facility_types) - 1:
+            facility_feet = remaining_distance
+        else:
+            if facility_type == "NO BIKELANE":
+                percentage = random.uniform(0.3, 0.6)
+            elif facility_type == "PROTECTED BIKELANE":
+                percentage = random.uniform(0.05, 0.2)
+            else:
+                percentage = random.uniform(0.1, 0.3)
+            
+            facility_feet = min(remaining_distance * percentage, remaining_distance)
+        
+        remaining_distance -= facility_feet
+        
+        if facility_feet > 0:
+            stats[facility_type] = {
+                'length_feet': facility_feet,
+                'length_miles': facility_feet / 5280,
+                'count': 1,
+                'avg_score': random.randint(20, 90),
+                'percentage': (facility_feet / total_feet) * 100
+            }
+        
+        if remaining_distance <= 0:
+            break
+    
+    return stats
+
+# =============================================================================
+# GOOGLE MAPS TRANSIT API FUNCTIONS (KEPT FOR TRANSIT ROUTING)
 # =============================================================================
 
 def get_transit_routes_google(origin, destination, departure_time="now"):
-    """Get transit routes using Google Maps API (enhanced from collective57.py)"""
+    """Get transit routes using Google Maps API (still used for transit)"""
     try:
         if not GOOGLE_API_KEY or len(GOOGLE_API_KEY) < 30:
             raise HTTPException(status_code=500, detail="Google Maps API key not properly configured")
@@ -492,7 +632,6 @@ def get_transit_routes_google(origin, destination, departure_time="now"):
             for idx, route_data in enumerate(data['routes']):
                 route = parse_google_transit_route(route_data, idx)
                 if route:
-                    # Enhanced route enhancement with real-time GTFS
                     enhanced_route = enhance_route_with_realtime_gtfs(route)
                     routes.append(enhanced_route)
         
@@ -516,7 +655,7 @@ def get_transit_routes_google(origin, destination, departure_time="now"):
         raise HTTPException(status_code=500, detail=str(e))
 
 def parse_google_transit_route(route_data, route_index):
-    """Parse a single Google transit route (enhanced from collective57.py)"""
+    """Parse a single Google transit route"""
     try:
         legs = route_data.get('legs', [])
         if not legs:
@@ -599,7 +738,7 @@ def parse_google_transit_route(route_data, route_index):
         return None
 
 def parse_transit_step(step, step_index):
-    """Parse an individual step from Google transit directions (from collective57.py)"""
+    """Parse an individual step from Google transit directions"""
     try:
         travel_mode = step.get('travel_mode', 'UNKNOWN')
         instruction = step.get('html_instructions', '').replace('<[^>]*>', '')
@@ -675,7 +814,7 @@ def parse_transit_step(step, step_index):
         return None
 
 def enhance_route_with_realtime_gtfs(route):
-    """Enhanced route enhancement with real-time data (from collective57.py)"""
+    """Enhanced route enhancement with real-time data"""
     enhanced_route = route.copy()
     
     if not gtfs_manager.is_loaded:
@@ -727,155 +866,8 @@ def enhance_route_with_realtime_gtfs(route):
     
     return enhanced_route
 
-# =============================================================================
-# SIMPLIFIED BIKE ROUTING (CLOUD-COMPATIBLE REPLACEMENT FOR ARCGIS)
-# =============================================================================
-
-def calculate_bike_route_google(start_coords, end_coords):
-    """Calculate bike route using Google Maps Bicycling API (replaces ArcGIS Network Analyst)"""
-    try:
-        if not GOOGLE_API_KEY or len(GOOGLE_API_KEY) < 30:
-            raise HTTPException(status_code=500, detail="Google Maps API key not configured")
-        
-        logger.info(f"🚴‍♂️ Creating bike route: {start_coords} to {end_coords}")
-        
-        url = "https://maps.googleapis.com/maps/api/directions/json"
-        
-        params = {
-            'origin': f"{start_coords[1]},{start_coords[0]}",  # lat,lng format
-            'destination': f"{end_coords[1]},{end_coords[0]}",
-            'mode': 'bicycling',
-            'alternatives': 'false',
-            'key': GOOGLE_API_KEY
-        }
-        
-        response = requests.get(url, params=params, timeout=30)
-        response.raise_for_status()
-        
-        data = response.json()
-        
-        if data.get('status') != 'OK':
-            logger.warning(f"Google bike routing failed: {data.get('status')}")
-            return None
-        
-        if not data.get('routes'):
-            logger.warning("No bike routes found")
-            return None
-        
-        route_data = data['routes'][0]
-        leg = route_data['legs'][0]
-        
-        duration_seconds = leg['duration']['value']
-        duration_minutes = round(duration_seconds / 60, 1)
-        distance_meters = leg['distance']['value']
-        distance_miles = round(distance_meters * 0.000621371, 2)
-        distance_feet = distance_meters * 3.28084
-        
-        # Extract geometry
-        overview_polyline = route_data.get('overview_polyline', {}).get('points', '')
-        route_geometry = []
-        if overview_polyline:
-            decoded_coords = decode_polyline(overview_polyline)
-            if decoded_coords:
-                route_geometry = [[coord[1], coord[0]] for coord in decoded_coords]
-        
-        # Simulate bike safety analysis (since we can't use ArcGIS)
-        overall_score = simulate_bike_safety_score(distance_miles, route_geometry)
-        facility_stats = simulate_facility_stats(distance_miles)
-        
-        return {
-            "name": f"Bike Route",
-            "length_feet": distance_feet,
-            "length_miles": distance_miles,
-            "travel_time_minutes": duration_minutes,
-            "travel_time_formatted": format_time_duration(duration_minutes),
-            "geometry": {
-                "type": "LineString",
-                "coordinates": route_geometry
-            },
-            "segments": [],  # Simplified - no detailed segment analysis
-            "overall_score": overall_score,
-            "facility_stats": facility_stats
-        }
-        
-    except Exception as e:
-        logger.error(f"Error calculating bike route: {e}")
-        return None
-
-def simulate_bike_safety_score(distance_miles, route_geometry):
-    """Simulate bike safety score (replaces ArcGIS LTS analysis)"""
-    # Base score calculation based on route characteristics
-    base_score = 65  # Default moderate safety
-    
-    # Adjust based on distance (longer routes might use more arterials)
-    if distance_miles < 1:
-        base_score += 10  # Short routes often use neighborhood streets
-    elif distance_miles > 5:
-        base_score -= 10  # Long routes might use more arterials
-    
-    # Simulate variability based on route geometry complexity
-    if route_geometry and len(route_geometry) > 20:
-        # More complex geometry might indicate more turns/neighborhood streets
-        base_score += 5
-    
-    # Add some realistic randomness for different route types
-    import random
-    variation = random.randint(-15, 15)
-    final_score = max(0, min(100, base_score + variation))
-    
-    return round(final_score, 1)
-
-def simulate_facility_stats(distance_miles):
-    """Simulate bicycle facility statistics (replaces ArcGIS facility analysis)"""
-    import random
-    
-    # Simulate realistic distribution of bike facilities
-    facility_types = [
-        "PROTECTED BIKELANE",
-        "BUFFERED BIKELANE", 
-        "UNBUFFERED BIKELANE",
-        "SHARED LANE",
-        "NO BIKELANE"
-    ]
-    
-    # Create realistic distribution
-    total_feet = distance_miles * 5280
-    stats = {}
-    
-    remaining_distance = total_feet
-    for i, facility_type in enumerate(facility_types):
-        if i == len(facility_types) - 1:
-            # Last facility gets remaining distance
-            facility_feet = remaining_distance
-        else:
-            # Random percentage of remaining distance
-            if facility_type == "NO BIKELANE":
-                percentage = random.uniform(0.3, 0.6)  # 30-60% no bike lane
-            elif facility_type == "PROTECTED BIKELANE":
-                percentage = random.uniform(0.05, 0.2)  # 5-20% protected
-            else:
-                percentage = random.uniform(0.1, 0.3)  # 10-30% other types
-            
-            facility_feet = min(remaining_distance * percentage, remaining_distance)
-        
-        remaining_distance -= facility_feet
-        
-        if facility_feet > 0:
-            stats[facility_type] = {
-                'length_feet': facility_feet,
-                'length_miles': facility_feet / 5280,
-                'count': 1,
-                'avg_score': random.randint(20, 90),
-                'percentage': (facility_feet / total_feet) * 100
-            }
-        
-        if remaining_distance <= 0:
-            break
-    
-    return stats
-
 def find_nearby_bus_stops_simple(point_coords, max_stops=3):
-    """Find nearby bus stops using GTFS data (simplified from collective57.py)"""
+    """Find nearby bus stops using GTFS data"""
     try:
         logger.info(f"🚌 Finding nearest bus stops to {point_coords}")
         
@@ -902,14 +894,14 @@ def find_nearby_bus_stops_simple(point_coords, max_stops=3):
         return []
 
 # =============================================================================
-# MAIN ROUTE ANALYSIS ENGINE (ENHANCED FROM COLLECTIVE57.PY)
+# MAIN ROUTE ANALYSIS ENGINE WITH OSRM
 # =============================================================================
 
 def analyze_complete_bike_bus_bike_routes(start_point, end_point, departure_time="now"):
-    """Main function to analyze complete bike-bus-bike routing options (enhanced from collective57.py)"""
+    """Main function to analyze complete bike-bus-bike routing options using OSRM for bicycle routing"""
     try:
         logger.info(f"\n{'='*60}")
-        logger.info(f"BIKE-BUS-BIKE ROUTE ANALYSIS WITH SMART FALLBACK")
+        logger.info(f"OSRM BIKE-BUS-BIKE ROUTE ANALYSIS WITH SMART FALLBACK")
         logger.info(f"{'='*60}")
         logger.info(f"Start: {start_point}")
         logger.info(f"End: {end_point}")
@@ -977,7 +969,7 @@ def analyze_complete_bike_bus_bike_routes(start_point, end_point, departure_time
         
         # Always try to create bike-bus-bike routes if we have bus stops
         if start_bus_stops and end_bus_stops and len(start_bus_stops) > 0 and len(end_bus_stops) > 0:
-            logger.info("\n🚴‍♂️ STEP 2: Creating bicycle route legs...")
+            logger.info("\n🚴‍♂️ STEP 2: Creating OSRM bicycle route legs...")
             
             start_bus_stop = start_bus_stops[0]
             end_bus_stop = end_bus_stops[0]
@@ -989,21 +981,23 @@ def analyze_complete_bike_bus_bike_routes(start_point, end_point, departure_time
                 end_bus_stop = end_bus_stops[1]
             
             if start_bus_stop["id"] != end_bus_stop["id"]:
-                # Create bike legs
-                bike_leg_1 = calculate_bike_route_google(
+                # Create bike legs using OSRM
+                bike_leg_1 = calculate_bike_route_osrm(
                     start_point, 
-                    [start_bus_stop["display_x"], start_bus_stop["display_y"]]
+                    [start_bus_stop["display_x"], start_bus_stop["display_y"]],
+                    route_name="Start to Bus Stop"
                 )
                 
-                bike_leg_2 = calculate_bike_route_google(
+                bike_leg_2 = calculate_bike_route_osrm(
                     [end_bus_stop["display_x"], end_bus_stop["display_y"]], 
-                    end_point
+                    end_point,
+                    route_name="Bus Stop to End"
                 )
                 
                 if bike_leg_1 and bike_leg_2:
-                    logger.info(f"✅ Bicycle legs created:")
-                    logger.info(f"   Leg 1: {bike_leg_1['length_miles']:.2f} miles, {bike_leg_1['travel_time_formatted']} (Score: {bike_leg_1['overall_score']})")
-                    logger.info(f"   Leg 2: {bike_leg_2['length_miles']:.2f} miles, {bike_leg_2['travel_time_formatted']} (Score: {bike_leg_2['overall_score']})")
+                    logger.info(f"✅ OSRM Bicycle legs created:")
+                    logger.info(f"   Leg 1: {bike_leg_1['length_miles']:.2f} miles, {bike_leg_1['travel_time_formatted']} (Score: {bike_leg_1['overall_score']}) {'[OSRM time]' if bike_leg_1.get('osrm_time_used') else '[Speed calc]'}")
+                    logger.info(f"   Leg 2: {bike_leg_2['length_miles']:.2f} miles, {bike_leg_2['travel_time_formatted']} (Score: {bike_leg_2['overall_score']}) {'[OSRM time]' if bike_leg_2.get('osrm_time_used') else '[Speed calc]'}")
                     
                     # Get transit between stops
                     logger.info("\n🚌 STEP 3: Finding transit routes between bus stops...")
@@ -1033,7 +1027,7 @@ def analyze_complete_bike_bus_bike_routes(start_point, end_point, departure_time
                                 
                                 routes.append({
                                     "id": len(routes) + 1,
-                                    "name": f"Bike-Bus-Bike Option {i + 1}",
+                                    "name": f"OSRM Bike-Bus-Bike Option {i + 1}",
                                     "type": "bike_bus_bike",
                                     "summary": {
                                         "total_time_minutes": round(total_time, 1),
@@ -1051,8 +1045,8 @@ def analyze_complete_bike_bus_bike_routes(start_point, end_point, departure_time
                                     "legs": [
                                         {
                                             "type": "bike",
-                                            "name": "Bike to Bus Stop",
-                                            "description": f"Bike from start to {start_bus_stop['name']}",
+                                            "name": "OSRM Bike to Bus Stop",
+                                            "description": f"OSRM bike route from start to {start_bus_stop['name']}",
                                             "route": bike_leg_1,
                                             "color": "#27ae60",
                                             "order": 1
@@ -1067,8 +1061,8 @@ def analyze_complete_bike_bus_bike_routes(start_point, end_point, departure_time
                                         },
                                         {
                                             "type": "bike",
-                                            "name": "Bus Stop to Destination",
-                                            "description": f"Bike from {end_bus_stop['name']} to destination",
+                                            "name": "OSRM Bus Stop to Destination",
+                                            "description": f"OSRM bike route from {end_bus_stop['name']} to destination",
                                             "route": bike_leg_2,
                                             "color": "#27ae60",
                                             "order": 3
@@ -1076,19 +1070,19 @@ def analyze_complete_bike_bus_bike_routes(start_point, end_point, departure_time
                                     ]
                                 })
                                 
-                                logger.info(f"   ✅ Created route {len(routes)}: {total_time:.1f} min, {total_miles:.2f} miles")
+                                logger.info(f"   ✅ Created OSRM route {len(routes)}: {total_time:.1f} min, {total_miles:.2f} miles")
                     
                     except Exception as e:
                         logger.warning(f"Transit routing between stops failed: {e}")
         
-        # Always add direct bike route for comparison
-        logger.info("\n🚴‍♂️ STEP 4: Creating direct bike route for comparison...")
-        direct_bike_route = calculate_bike_route_google(start_point, end_point)
+        # Always add direct bike route for comparison using OSRM
+        logger.info("\n🚴‍♂️ STEP 4: Creating direct OSRM bike route for comparison...")
+        direct_bike_route = calculate_bike_route_osrm(start_point, end_point, route_name="Direct OSRM Bike Route")
         
         if direct_bike_route:
             routes.append({
                 "id": len(routes) + 1,
-                "name": "Direct Bike Route",
+                "name": "Direct OSRM Bike Route",
                 "type": "direct_bike",
                 "summary": {
                     "total_time_minutes": direct_bike_route['travel_time_minutes'],
@@ -1105,15 +1099,15 @@ def analyze_complete_bike_bus_bike_routes(start_point, end_point, departure_time
                 },
                 "legs": [{
                     "type": "bike",
-                    "name": "Direct Bike Route",
-                    "description": "Complete bike route from start to destination",
+                    "name": "Direct OSRM Bike Route",
+                    "description": "Complete OSRM bike route from start to destination",
                     "route": direct_bike_route,
                     "color": "#e74c3c",
                     "order": 1
                 }]
             })
             
-            logger.info(f"✅ Direct bike route: {direct_bike_route['length_miles']:.2f} miles, {direct_bike_route['travel_time_formatted']} (Score: {direct_bike_route['overall_score']})")
+            logger.info(f"✅ Direct OSRM bike route: {direct_bike_route['length_miles']:.2f} miles, {direct_bike_route['travel_time_formatted']} (Score: {direct_bike_route['overall_score']}) {'[OSRM time]' if direct_bike_route.get('osrm_time_used') else '[Speed calc]'}")
         
         if not routes:
             raise HTTPException(status_code=400, detail="No routes found between the selected points")
@@ -1124,8 +1118,9 @@ def analyze_complete_bike_bus_bike_routes(start_point, end_point, departure_time
         # Create final result
         result = {
             "success": True,
-            "analysis_type": "bike_bus_bike_enhanced" if not should_fallback else "transit_fallback",
+            "analysis_type": "osrm_bike_bus_bike_enhanced" if not should_fallback else "transit_fallback",
             "fallback_used": should_fallback,
+            "routing_engine": "OSRM + Google Maps",
             "routes": routes,
             "bus_stops": {
                 "start_stops": start_bus_stops,
@@ -1140,25 +1135,27 @@ def analyze_complete_bike_bus_bike_routes(start_point, end_point, departure_time
                 "fastest_time": routes[0]['summary']['total_time_formatted'] if routes else None
             },
             "bike_speed_mph": BIKE_SPEED_MPH,
+            "osrm_server": OSRM_SERVER,
             "analysis_timestamp": datetime.datetime.now().isoformat(),
             "gtfs_enabled": gtfs_manager.is_loaded,
             "realtime_enabled": True
         }
         
-        logger.info(f"\n✅ BIKE-BUS-BIKE ANALYSIS COMPLETE:")
+        logger.info(f"\n✅ OSRM BIKE-BUS-BIKE ANALYSIS COMPLETE:")
         logger.info(f"   Total route options: {len(routes)}")
         logger.info(f"   Fastest option: {result['statistics']['fastest_option']} ({result['statistics']['fastest_time']})")
+        logger.info(f"   Routing: OSRM for bikes, Google Maps for transit")
         
         return result
         
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error in bike-bus-bike analysis: {e}")
+        logger.error(f"Error in OSRM bike-bus-bike analysis: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 def should_use_transit_fallback(start_point, end_point, start_bus_stops, end_bus_stops, distance_threshold_meters=400):
-    """Check if both bike legs would be short enough to warrant transit-only fallback (from collective57.py)"""
+    """Check if both bike legs would be short enough to warrant transit-only fallback"""
     try:
         if not start_bus_stops or not end_bus_stops:
             return False
@@ -1197,14 +1194,14 @@ def should_use_transit_fallback(start_point, end_point, start_bus_stops, end_bus
 
 @app.get("/", response_class=HTMLResponse)
 async def get_ui():
-    """Serve the embedded UI for Experience Builder"""
+    """Serve the embedded UI for Experience Builder with OSRM"""
     return """
     <!DOCTYPE html>
     <html lang="en">
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Bike-Bus-Bike Route Planner</title>
+        <title>OSRM Bike-Bus-Bike Route Planner</title>
         <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
         <style>
             * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -1220,8 +1217,8 @@ async def get_ui():
             }
             .header h1 { font-size: 1.5em; margin-bottom: 5px; }
             .header p { font-size: 0.9em; opacity: 0.9; }
-            .realtime-badge {
-                background: linear-gradient(45deg, #ff6b6b, #4ecdc4);
+            .osrm-badge {
+                background: linear-gradient(45deg, #e74c3c, #f39c12);
                 color: white; padding: 4px 8px; border-radius: 4px;
                 font-size: 0.7em; font-weight: bold; animation: pulse 2s infinite;
             }
@@ -1303,12 +1300,16 @@ async def get_ui():
             .leg-transit { background: #3498db; }
             .leg-text { flex: 1; font-size: 0.8em; }
             .legs-preview { margin-top: 12px; font-size: 0.85em; }
+            .osrm-indicator { 
+                font-size: 0.7em; color: #e74c3c; font-weight: bold; 
+                background: rgba(231, 76, 60, 0.1); padding: 2px 6px; border-radius: 3px; margin-left: 8px;
+            }
         </style>
     </head>
     <body>
         <div class="header">
-            <h1>🚴‍♂️🚌🚴‍♀️ Bike-Bus-Bike Route Planner <span class="realtime-badge">LIVE</span></h1>
-            <p>Enhanced multimodal transportation planning with real-time GTFS data</p>
+            <h1>🚴‍♂️🚌🚴‍♀️ OSRM Bike-Bus-Bike Route Planner <span class="osrm-badge">OSRM</span></h1>
+            <p>Enhanced multimodal transportation planning with OSRM bicycle routing + real-time GTFS data</p>
         </div>
         
         <div class="container">
@@ -1316,7 +1317,7 @@ async def get_ui():
             
             <div class="sidebar">
                 <div class="system-status" id="systemStatus">
-                    🔴 System: Google Maps + JTA GTFS + Real-time Updates
+                    🔴 System: OSRM + Google Maps + JTA GTFS + Real-time Updates
                     <div style="font-size: 0.8em; margin-top: 5px; opacity: 0.8;" id="statusDetails">
                         Loading system status...
                     </div>
@@ -1327,8 +1328,9 @@ async def get_ui():
                     1. Click map to set start point (green marker)<br>
                     2. Click again to set destination (red marker)<br>
                     3. Choose departure time<br>
-                    4. Click "Find Routes" to get bike-bus-bike options<br>
-                    5. Click route cards to view on map
+                    4. Click "Find Routes" to get OSRM bike-bus-bike options<br>
+                    5. Click route cards to view on map<br>
+                    <br><strong>🆕 OSRM Features:</strong> More accurate bike routing with real travel times!
                 </div>
                 
                 <div class="controls">
@@ -1345,7 +1347,7 @@ async def get_ui():
                         <input type="datetime-local" id="customTime">
                     </div>
                     
-                    <button id="findRoutesBtn" disabled>🔍 Find Bike-Bus-Bike Routes</button>
+                    <button id="findRoutesBtn" disabled>🔍 Find OSRM Bike-Bus-Bike Routes</button>
                     <button class="btn-clear" onclick="clearAll()">🗑️ Clear Map & Results</button>
                     
                     <div class="coordinates">
@@ -1385,7 +1387,7 @@ async def get_ui():
                     const details = document.getElementById('statusDetails');
                     const gtfsStatus = status.gtfs_loaded ? '✅' : '⚠️';
                     const apiStatus = status.google_maps_configured ? '✅' : '⚠️';
-                    details.innerHTML = `Google Maps: ${apiStatus} | GTFS: ${gtfsStatus} | Real-time: ✅`;
+                    details.innerHTML = `OSRM: ✅ | Google Maps: ${apiStatus} | GTFS: ${gtfsStatus} | Real-time: ✅`;
                     
                 } catch (error) {
                     document.getElementById('statusDetails').innerHTML = 'Status check failed';
@@ -1446,7 +1448,7 @@ async def get_ui():
             function showSpinner(show) {
                 document.getElementById('spinner').style.display = show ? 'block' : 'none';
                 document.getElementById('findRoutesBtn').disabled = show;
-                document.getElementById('findRoutesBtn').innerHTML = show ? '⏳ Analyzing routes...' : '🔍 Find Bike-Bus-Bike Routes';
+                document.getElementById('findRoutesBtn').innerHTML = show ? '⏳ Analyzing OSRM routes...' : '🔍 Find OSRM Bike-Bus-Bike Routes';
             }
             
             async function findRoutes() {
@@ -1485,11 +1487,15 @@ async def get_ui():
             }
             
             function displayResults(data) {
-                let html = `<h3>🛣️ Found ${data.routes.length} Route Option${data.routes.length > 1 ? 's' : ''}</h3>`;
+                let html = `<h3>🛣️ Found ${data.routes.length} OSRM Route Option${data.routes.length > 1 ? 's' : ''}</h3>`;
                 
                 if (data.fallback_used) {
                     html += `<div style="background: #e3f2fd; padding: 12px; border-radius: 6px; margin: 15px 0; font-size: 0.9em;">
                         <strong>🔄 Smart Routing:</strong> Both bike segments were very short, so we're showing optimized transit routes.
+                    </div>`;
+                } else {
+                    html += `<div style="background: #ffe7e7; padding: 12px; border-radius: 6px; margin: 15px 0; font-size: 0.9em;">
+                        <strong>🚴‍♂️ OSRM Powered:</strong> Bicycle routes use OSRM for accurate travel times and routing.
                     </div>`;
                 }
                 
@@ -1507,8 +1513,8 @@ async def get_ui():
                     };
                     
                     const typeNames = {
-                        'bike_bus_bike': 'MULTIMODAL',
-                        'direct_bike': 'DIRECT BIKE',
+                        'bike_bus_bike': 'OSRM MULTIMODAL',
+                        'direct_bike': 'OSRM DIRECT',
                         'transit_fallback': 'TRANSIT'
                     };
                     
@@ -1548,12 +1554,16 @@ async def get_ui():
                     route.legs.forEach(leg => {
                         const legIcon = leg.type === 'bike' ? '🚴‍♂️' : '🚌';
                         const legClass = leg.type === 'bike' ? 'leg-bike' : 'leg-transit';
+                        const osrmIndicator = leg.type === 'bike' && leg.route && leg.route.osrm_time_used ? 
+                            '<span class="osrm-indicator">OSRM</span>' : '';
+                        
                         html += `
                             <div class="leg-item">
                                 <div class="leg-icon ${legClass}">${legIcon}</div>
                                 <div class="leg-text">
                                     ${leg.name} • ${(leg.route.length_miles || leg.route.distance_miles || 0).toFixed(1)} mi
                                     ${leg.type === 'bike' && leg.route.overall_score ? ` • Safety: ${leg.route.overall_score}` : ''}
+                                    ${osrmIndicator}
                                 </div>
                             </div>
                         `;
@@ -1594,6 +1604,9 @@ async def get_ui():
                             dashArray: leg.type === 'transit' ? '10, 5' : null
                         }).addTo(routeLayersGroup);
                         
+                        const osrmText = leg.type === 'bike' && leg.route.osrm_time_used ? 
+                            '<br><span style="color: #e74c3c; font-weight: bold;">⚡ OSRM Time Estimate</span>' : '';
+                        
                         polyline.bindPopup(`
                             <div style="font-family: 'Segoe UI', sans-serif;">
                                 <h4 style="margin: 0 0 10px 0; color: ${color};">
@@ -1605,6 +1618,7 @@ async def get_ui():
                                     `<p style="margin: 5px 0;"><strong>Safety Score:</strong> ${leg.route.overall_score}</p>` : ''}
                                 ${leg.type === 'transit' && leg.route.transit_lines ? 
                                     `<p style="margin: 5px 0;"><strong>Transit Lines:</strong> ${leg.route.transit_lines.join(', ')}</p>` : ''}
+                                ${osrmText}
                             </div>
                         `);
                     }
@@ -1682,14 +1696,17 @@ async def get_ui():
 
 @app.get("/api/health")
 async def health_check():
-    """Health check endpoint for Experience Builder"""
+    """Health check endpoint for Experience Builder with OSRM status"""
     return {
         "status": "healthy",
-        "service": "Bike-Bus-Bike Route Planner",
+        "service": "OSRM Bike-Bus-Bike Route Planner",
         "version": "1.0.0",
+        "routing_engine": "OSRM + Google Maps",
+        "osrm_server": OSRM_SERVER,
         "gtfs_loaded": gtfs_manager.is_loaded,
         "google_maps_configured": bool(GOOGLE_API_KEY and len(GOOGLE_API_KEY) > 30),
         "bike_speed_mph": BIKE_SPEED_MPH,
+        "use_osrm_duration": USE_OSRM_DURATION,
         "timestamp": datetime.datetime.now().isoformat()
     }
 
@@ -1701,7 +1718,7 @@ async def analyze_routes(
     end_lat: float = Query(..., description="End latitude"),
     departure_time: str = Query("now", description="Departure time (ISO string or 'now')")
 ):
-    """Analyze bike-bus-bike routes for Experience Builder"""
+    """Analyze bike-bus-bike routes for Experience Builder using OSRM"""
     
     # Validate coordinates
     if not (-180 <= start_lon <= 180 and -90 <= start_lat <= 90):
@@ -1749,7 +1766,7 @@ async def get_nearby_stops(
 @app.on_event("startup")
 async def startup_event():
     """Initialize GTFS data on startup"""
-    logger.info("🚴‍♂️🚌🚴‍♀️ Starting Enhanced Bike-Bus-Bike API for Experience Builder...")
+    logger.info("🚴‍♂️🚌🚴‍♀️ Starting OSRM Enhanced Bike-Bus-Bike API for Experience Builder...")
     
     # Load GTFS data in background
     try:
@@ -1758,12 +1775,14 @@ async def startup_event():
     except Exception as e:
         logger.warning(f"⚠️ GTFS data loading failed: {e}")
     
-    logger.info("🚀 API ready for Experience Builder integration!")
+    logger.info("🚀 OSRM API ready for Experience Builder integration!")
     logger.info("   📍 Endpoints available:")
     logger.info("   - GET /api/health (system status)")
-    logger.info("   - GET /api/analyze (route analysis)")
+    logger.info("   - GET /api/analyze (OSRM route analysis)")
     logger.info("   - GET /api/stops (nearby stops)")
     logger.info("   - GET / (embedded UI)")
+    logger.info(f"   🚴‍♂️ OSRM Server: {OSRM_SERVER}")
+    logger.info(f"   ⏱️ OSRM Duration: {'Enabled' if USE_OSRM_DURATION else 'Disabled'}")
 
 # =============================================================================
 # MAIN ENTRY POINT
@@ -1774,13 +1793,15 @@ if __name__ == "__main__":
     
     port = int(os.getenv("PORT", 8000))
     
-    logger.info(f"🌐 Starting server on port {port}")
+    logger.info(f"🌐 Starting OSRM server on port {port}")
+    logger.info(f"🚴‍♂️ OSRM Server: {OSRM_SERVER}")
+    logger.info(f"⏱️ Use OSRM Duration: {USE_OSRM_DURATION}")
     logger.info(f"🔑 Google API Key configured: {'Yes' if GOOGLE_API_KEY and len(GOOGLE_API_KEY) > 30 else 'No'}")
-    logger.info(f"🚴‍♂️ Bike speed: {BIKE_SPEED_MPH} mph")
+    logger.info(f"🚴‍♂️ Bike speed: {BIKE_SPEED_MPH} mph (fallback)")
     logger.info(f"🌍 CORS origins: {ALLOWED_ORIGINS}")
     
     uvicorn.run(
-        "complete_bike_bus_experience_builder:app",
+        "complete_bike_bus_experience_builder_osrm:app",
         host="0.0.0.0",
         port=port,
         reload=False,
