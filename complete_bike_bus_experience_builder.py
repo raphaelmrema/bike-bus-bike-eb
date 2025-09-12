@@ -730,8 +730,18 @@ async def get_home():
             }
 
             function createRouteCard(route) {
-                const routeTypeClass = route.type === 'direct_bike' ? 'type-bike' : 'type-transit';
-                const routeTypeText = route.type === 'direct_bike' ? 'BIKE' : 'TRANSIT';
+                let routeTypeClass, routeTypeText;
+                
+                if (route.type === 'bike_bus_bike') {
+                    routeTypeClass = 'type-bike';
+                    routeTypeText = 'MULTIMODAL';
+                } else if (route.type === 'direct_bike') {
+                    routeTypeClass = 'type-bike';
+                    routeTypeText = 'BIKE';
+                } else {
+                    routeTypeClass = 'type-transit';
+                    routeTypeText = 'TRANSIT';
+                }
                 
                 return `
                     <div class="route-card">
@@ -753,6 +763,11 @@ async def get_home():
                                 <span class="stat-label">Score</span>
                             </div>
                         </div>
+                        ${route.type === 'bike_bus_bike' ? `
+                        <div style="margin-top: 10px; padding: 10px; background: #e3f2fd; border-radius: 6px; font-size: 0.85em;">
+                            <strong>Multimodal Route:</strong> ${route.summary.bike_distance_miles.toFixed(1)} mi bike + ${(route.summary.total_distance_miles - route.summary.bike_distance_miles).toFixed(1)} mi transit
+                        </div>
+                        ` : ''}
                     </div>
                 `;
             }
@@ -760,37 +775,126 @@ async def get_home():
             function addRouteToMap(route) {
                 const routeColor = route.color || '#3498db';
                 
-                route.legs.forEach((leg) => {
-                    if (leg.route.geometry && leg.route.geometry.coordinates.length > 0) {
-                        const coords = leg.route.geometry.coordinates.map(coord => [coord[1], coord[0]]);
-                        const weight = leg.type === 'bike' ? 4 : 6;
-                        const dashArray = leg.type === 'transit' ? '10, 5' : null;
-                        
-                        const routeLine = L.polyline(coords, {
-                            color: leg.color || routeColor,
-                            weight: weight,
-                            opacity: 0.8,
-                            dashArray: dashArray
-                        });
-                        
-                        routeLine.bindPopup(`
-                            <div>
-                                <h4>${leg.name}</h4>
-                                <p><strong>Distance:</strong> ${(leg.route.length_miles || leg.route.distance_miles || 0).toFixed(2)} miles</p>
-                                <p><strong>Time:</strong> ${leg.route.travel_time_formatted || leg.route.duration_text || 'N/A'}</p>
-                            </div>
-                        `);
-                        
-                        if (!routeLayers.has(route.id)) {
-                            routeLayers.set(route.id, L.layerGroup());
+                route.legs.forEach((leg, legIndex) => {
+                    if (leg.route && leg.route.geometry && leg.route.geometry.coordinates && leg.route.geometry.coordinates.length > 0) {
+                        try {
+                            // Ensure coordinates are properly formatted [lat, lng]
+                            const coords = leg.route.geometry.coordinates.map(coord => {
+                                // Handle both [lng, lat] and [lat, lng] formats
+                                if (Array.isArray(coord) && coord.length === 2) {
+                                    const lat = typeof coord[1] === 'number' ? coord[1] : parseFloat(coord[1]);
+                                    const lng = typeof coord[0] === 'number' ? coord[0] : parseFloat(coord[0]);
+                                    
+                                    // Basic validation
+                                    if (isNaN(lat) || isNaN(lng)) {
+                                        console.warn('Invalid coordinate:', coord);
+                                        return null;
+                                    }
+                                    
+                                    // Ensure lat/lng are in valid ranges
+                                    if (lat < -90 || lat > 90 || lng < -180 || lng > 180) {
+                                        console.warn('Coordinate out of range:', coord);
+                                        return null;
+                                    }
+                                    
+                                    return [lat, lng];
+                                }
+                                return null;
+                            }).filter(coord => coord !== null);
+                            
+                            if (coords.length < 2) {
+                                console.warn('Not enough valid coordinates for leg:', leg.name);
+                                return;
+                            }
+                            
+                            const weight = leg.type === 'bike' ? 4 : 6;
+                            const dashArray = leg.type === 'transit' ? '10, 5' : null;
+                            const legColor = leg.color || routeColor;
+                            
+                            const routeLine = L.polyline(coords, {
+                                color: legColor,
+                                weight: weight,
+                                opacity: 0.8,
+                                dashArray: dashArray
+                            });
+                            
+                            // Add popup with route information
+                            const distance = leg.route.length_miles || leg.route.distance_miles || 0;
+                            const time = leg.route.travel_time_formatted || leg.route.duration_text || 'N/A';
+                            
+                            routeLine.bindPopup(`
+                                <div style="font-family: 'Segoe UI', sans-serif; max-width: 200px;">
+                                    <h4 style="margin: 0 0 8px 0; color: ${legColor};">
+                                        ${leg.type === 'bike' ? '🚴‍♂️' : '🚌'} ${leg.name}
+                                    </h4>
+                                    <p style="margin: 4px 0;"><strong>Distance:</strong> ${distance.toFixed(2)} miles</p>
+                                    <p style="margin: 4px 0;"><strong>Time:</strong> ${time}</p>
+                                    ${leg.type === 'bike' && leg.route.overall_score ? 
+                                        `<p style="margin: 4px 0;"><strong>Safety Score:</strong> ${leg.route.overall_score}</p>` : ''}
+                                    ${leg.type === 'transit' && leg.route.transit_lines ? 
+                                        `<p style="margin: 4px 0;"><strong>Lines:</strong> ${leg.route.transit_lines.join(', ')}</p>` : ''}
+                                </div>
+                            `);
+                            
+                            // Add to layer group
+                            if (!routeLayers.has(route.id)) {
+                                routeLayers.set(route.id, L.layerGroup());
+                            }
+                            routeLayers.get(route.id).addLayer(routeLine);
+                            
+                            // Add transit stop markers for transit legs
+                            if (leg.type === 'transit' && leg.route.steps) {
+                                addTransitStopsToMap(leg.route.steps, route.id);
+                            }
+                            
+                        } catch (error) {
+                            console.error('Error adding leg to map:', error, leg);
                         }
-                        routeLayers.get(route.id).addLayer(routeLine);
+                    } else {
+                        console.warn('Leg missing geometry data:', leg.name);
                     }
                 });
                 
+                // Add the complete route layer to map
                 if (routeLayers.has(route.id)) {
                     routeLayers.get(route.id).addTo(map);
                 }
+            }
+            
+            function addTransitStopsToMap(steps, routeId) {
+                if (!steps || !Array.isArray(steps)) return;
+                
+                steps.forEach(step => {
+                    if (step.travel_mode === 'TRANSIT') {
+                        // Add departure stop if coordinates are available
+                        if (step.departure_stop_location && 
+                            typeof step.departure_stop_location.lat === 'number' && 
+                            typeof step.departure_stop_location.lng === 'number') {
+                            
+                            const stopIcon = L.divIcon({
+                                html: '<div style="width: 12px; height: 12px; background: #3498db; border: 2px solid white; border-radius: 50%;"></div>',
+                                className: 'transit-stop-marker',
+                                iconSize: [16, 16],
+                                iconAnchor: [8, 8]
+                            });
+                            
+                            const stopMarker = L.marker(
+                                [step.departure_stop_location.lat, step.departure_stop_location.lng], 
+                                { icon: stopIcon }
+                            ).bindPopup(`
+                                <div style="font-family: 'Segoe UI', sans-serif;">
+                                    <h5 style="margin: 0 0 6px 0; color: #3498db;">🚏 ${step.departure_stop_name || 'Transit Stop'}</h5>
+                                    <p style="margin: 2px 0; font-size: 0.9em;"><strong>Line:</strong> ${step.transit_line || 'N/A'}</p>
+                                    <p style="margin: 2px 0; font-size: 0.9em;"><strong>Departure:</strong> ${step.scheduled_departure || 'N/A'}</p>
+                                </div>
+                            `);
+                            
+                            if (routeLayers.has(routeId)) {
+                                routeLayers.get(routeId).addLayer(stopMarker);
+                            }
+                        }
+                    }
+                });
             }
 
             // Initialize
