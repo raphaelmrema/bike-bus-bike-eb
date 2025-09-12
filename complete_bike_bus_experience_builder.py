@@ -1,965 +1,651 @@
-# app.py - Railway Deployment Ready
-# OSRM + Google Maps Multi-Route Bike-Bus-Bike Planner
+# osrm_google_bbb_planner.py
+# OSRM (bike) + Google Directions (transit) – Bike–Bus–Bike planner
+# FastAPI app, Experience Builder–friendly, using env var GOOGLE_API_KEY
 
 import os
 import json
-import math
+import logging
 import requests
 import datetime
-import random
-from typing import List, Dict, Optional
+import math
+from typing import List, Dict, Optional, Tuple
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
-from fastapi.staticfiles import StaticFiles
 import uvicorn
 
-# Install polyline if needed
+# Ensure polyline is available (for decoding OSRM/Google polylines)
 try:
     import polyline
 except ImportError:
-    import subprocess
-    import sys
+    import subprocess, sys
     subprocess.check_call([sys.executable, "-m", "pip", "install", "polyline"])
     import polyline
 
 # =============================================================================
-# CONFIGURATION
+# CONFIG
 # =============================================================================
 
-# Environment variables for Railway
-GOOGLE_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY", "YOUR_GOOGLE_MAPS_API_KEY_HERE")
+# Read your Google API key from environment (DON'T hardcode in code/repos)
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
+
+# OSRM bicycle routing server (public demo)
 OSRM_SERVER = os.getenv("OSRM_SERVER", "http://router.project-osrm.org")
-BIKE_SPEED_MPH = int(os.getenv("BIKE_SPEED_MPH", "11"))
-PORT = int(os.getenv("PORT", "8000"))
+USE_OSRM_DURATION = True
+BIKE_SPEED_MPH = float(os.getenv("BIKE_SPEED_MPH", "11"))
+
+# Google endpoints
+GMAPS_DIRECTIONS_URL = "https://maps.googleapis.com/maps/api/directions/json"
+GMAPS_PLACES_NEARBY_URL = "https://maps.googleapis.com/maps/api/place/nearbysearch/json"
+
+# CORS (keep open for dev; lock down in prod)
+CORS_ALLOW_ORIGINS = os.getenv(
+    "ALLOWED_ORIGINS",
+    "*"
+).split(",")
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("osrm-google-bbb")
 
 # =============================================================================
-# FASTAPI APP SETUP
+# APP
 # =============================================================================
 
 app = FastAPI(
-    title="OSRM + Google Maps Route Planner",
-    version="1.0.0",
-    description="Multi-route bike and transit planning tool"
+    title="OSRM + Google Transit Bike–Bus–Bike Planner",
+    description="Multimodal routing with OSRM (bike) and Google Directions (transit), ready for ArcGIS Experience Builder.",
+    version="1.1.0",
 )
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=CORS_ALLOW_ORIGINS if CORS_ALLOW_ORIGINS != ["*"] else ["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # =============================================================================
-# UTILITY FUNCTIONS
+# UTILITIES
 # =============================================================================
 
-def format_time_duration(minutes):
-    """Format time duration in a user-friendly way"""
-    if minutes < 1:
-        return "< 1 min"
-    elif minutes < 60:
-        return f"{int(minutes)} min"
-    else:
-        hours = int(minutes // 60)
-        mins = int(minutes % 60)
-        return f"{hours}h {mins}m" if mins > 0 else f"{hours}h"
+def require_google_key():
+    if not GOOGLE_API_KEY or len(GOOGLE_API_KEY.strip()) < 20:
+        raise HTTPException(status_code=500, detail="GOOGLE_API_KEY is not set or invalid.")
 
-def is_valid_google_api_key():
-    """Check if Google Maps API key is valid"""
-    invalid_keys = [
-        "YOUR_GOOGLE_MAPS_API_KEY_HERE",
-        "AIzaSyBmGvPmWyKlR5DAtOu8vrmO0Cd8N1y4KF8",  # Demo key
-        "",
-        None
-    ]
-    return GOOGLE_API_KEY and GOOGLE_API_KEY not in invalid_keys and len(GOOGLE_API_KEY) > 30
+def format_time_duration(minutes: float) -> str:
+    if minutes < 1: return "< 1 min"
+    if minutes < 60: return f"{int(round(minutes))} min"
+    h = int(minutes // 60); m = int(round(minutes % 60))
+    return f"{h}h" if m == 0 else f"{h}h {m}m"
 
-def decode_polyline(polyline_str):
-    """Decode Google polyline string to coordinates"""
+def decode_polyline_to_lonlat(encoded: str) -> List[List[float]]:
+    pts = polyline.decode(encoded)
+    # polyline returns [(lat, lon)], we want [[lon, lat], ...] for GeoJSON/Leaflet handling consistency
+    return [[lon, lat] for (lat, lon) in pts]
+
+def parse_epoch_to_hhmm(ts: Optional[int]) -> str:
     try:
-        decoded = polyline.decode(polyline_str)
-        return [[lon, lat] for (lat, lon) in decoded]
-    except:
-        return []
+        if not ts: return "Unknown"
+        return datetime.datetime.fromtimestamp(ts).strftime("%H:%M")
+    except Exception:
+        return "Unknown"
 
 # =============================================================================
 # OSRM BICYCLE ROUTING
 # =============================================================================
 
-def generate_alternative_waypoints(start_coords, end_coords, num_alternatives=3):
-    """Generate waypoints for alternative routes"""
+def calculate_bike_route_osrm(start_coords: List[float], end_coords: List[float], route_name="Bike Route"):
+    """start/end: [lon, lat]"""
     try:
-        start_lon, start_lat = start_coords
-        end_lon, end_lat = end_coords
-
-        center_lon = (start_lon + end_lon) / 2
-        center_lat = (start_lat + end_lat) / 2
-        distance = math.sqrt((end_lon - start_lon)**2 + (end_lat - start_lat)**2)
-        variation_radius = distance * 0.3
-
-        waypoint_sets = []
-        for i in range(num_alternatives):
-            angle = (i * 2 * math.pi / num_alternatives) + random.uniform(-0.5, 0.5)
-            radius = variation_radius * random.uniform(0.4, 1.2)
-            waypoint_lon = center_lon + radius * math.cos(angle)
-            waypoint_lat = center_lat + radius * math.sin(angle)
-            waypoint_sets.append([waypoint_lon, waypoint_lat])
-
-        return waypoint_sets
-    except:
-        return []
-
-def create_osrm_bike_route(start_coords, end_coords, waypoints=None, route_name="Bike Route"):
-    """Create bike route using OSRM"""
-    try:
-        # Build coordinates string
-        coords_list = [f"{start_coords[0]},{start_coords[1]}"]
-        if waypoints:
-            for wp in waypoints:
-                coords_list.append(f"{wp[0]},{wp[1]}")
-        coords_list.append(f"{end_coords[0]},{end_coords[1]}")
-        coords = ";".join(coords_list)
-
+        coords = f"{start_coords[0]},{start_coords[1]};{end_coords[0]},{end_coords[1]}"
         url = f"{OSRM_SERVER}/route/v1/cycling/{coords}"
-        params = {
-            "overview": "full",
-            "geometries": "polyline",
-            "steps": "true",
-            "alternatives": "false",
-        }
-
-        response = requests.get(url, params=params, timeout=30)
-        response.raise_for_status()
-        data = response.json()
-
-        if data.get("code") != "Ok" or not data.get("routes"):
-            return None
+        params = {"overview": "full", "geometries": "polyline", "steps": "false", "alternatives": "false"}
+        r = requests.get(url, params=params, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+        if data.get("code") != "Ok" or not data.get("routes"): return None
 
         route = data["routes"][0]
+        distance_m = float(route.get("distance", 0.0))
+        distance_mi = distance_m * 0.000621371
 
-        # Extract geometry
-        geometry_polyline = route["geometry"]
-        route_geometry = {
-            "type": "LineString",
-            "coordinates": decode_polyline(geometry_polyline)
-        }
-
-        # Distance and duration
-        distance_meters = float(route.get("distance", 0.0))
-        distance_miles = distance_meters * 0.000621371
-
-        # Use OSRM duration if available, otherwise calculate from speed
-        osrm_duration_sec = route.get("duration")
-        if osrm_duration_sec and osrm_duration_sec > 0:
-            travel_time_minutes = float(osrm_duration_sec) / 60.0
+        if USE_OSRM_DURATION and route.get("duration") is not None:
+            duration_min = float(route["duration"]) / 60.0
         else:
-            travel_time_minutes = (distance_miles / BIKE_SPEED_MPH) * 60.0
+            duration_min = (distance_mi / BIKE_SPEED_MPH) * 60.0
 
-        # Simple scoring based on route characteristics
-        base_score = 70
-        if distance_miles > 5:
-            base_score += 5  # Longer routes often use better infrastructure
-        if waypoints:
-            base_score += 10  # Alternative routes might avoid main roads
+        coords_lonlat = decode_polyline_to_lonlat(route["geometry"])
+
+        # Simple placeholder “score”; replace with your facility-based scoring if desired
+        score = max(0, min(100, 70 + (10 if distance_mi < 2 else -5)))
 
         return {
             "name": route_name,
-            "length_feet": distance_meters * 3.28084,
-            "length_miles": distance_miles,
-            "travel_time_minutes": travel_time_minutes,
-            "travel_time_formatted": format_time_duration(travel_time_minutes),
-            "geometry": route_geometry,
-            "overall_score": min(100, max(20, base_score)),
-            "waypoints": waypoints or [],
+            "length_miles": round(distance_mi, 3),
+            "travel_time_minutes": round(duration_min, 1),
+            "travel_time_formatted": format_time_duration(duration_min),
+            "geometry": {"type": "LineString", "coordinates": coords_lonlat},
+            "overall_score": score,
         }
-
     except Exception as e:
-        print(f"Error creating OSRM route: {e}")
+        logger.error(f"OSRM error: {e}")
         return None
 
-def create_multiple_bike_routes(start_coords, end_coords, num_routes=4):
-    """Create multiple alternative bike routes"""
-    routes = []
-
-    # Direct route first
-    direct_route = create_osrm_bike_route(start_coords, end_coords, None, "Direct Route")
-    if direct_route:
-        direct_route['route_type'] = 'direct'
-        routes.append(direct_route)
-
-    # Generate alternative routes
-    if num_routes > 1:
-        waypoint_sets = generate_alternative_waypoints(start_coords, end_coords, num_routes - 1)
-        route_names = ["Scenic Route", "Alternative Route", "Extended Route", "Northern Route", "Southern Route"]
-
-        for i, waypoints in enumerate(waypoint_sets):
-            route_name = route_names[i] if i < len(route_names) else f"Route {i + 2}"
-            alt_route = create_osrm_bike_route(start_coords, end_coords, [waypoints], route_name)
-            if alt_route:
-                alt_route['route_type'] = 'alternative'
-                routes.append(alt_route)
-
-    # Sort by score then distance
-    routes.sort(key=lambda r: (-r.get('overall_score', 0), r.get('length_miles', 999)))
-    return routes
-
 # =============================================================================
-# GOOGLE MAPS TRANSIT ROUTING
+# GOOGLE TRANSIT (DIRECTIONS) + STOPS (PLACES)
 # =============================================================================
 
-def get_google_transit_routes(origin, destination, departure_time="now"):
-    """Get transit routes using Google Maps API"""
+def _gmaps_departure_timestamp(departure_time: str) -> int:
+    if departure_time == "now":
+        return int(datetime.datetime.now().timestamp())
     try:
-        if not is_valid_google_api_key():
-            return {"error": "Google Maps API key not configured"}
+        return int(float(departure_time))  # epoch seconds
+    except Exception:
+        return int(datetime.datetime.now().timestamp())
 
-        url = "https://maps.googleapis.com/maps/api/directions/json"
-        
-        if departure_time == "now":
-            departure_timestamp = int(datetime.datetime.now().timestamp())
-        else:
-            departure_timestamp = departure_time
-        
+def get_transit_routes_google(
+    origin: Tuple[float, float],
+    destination: Tuple[float, float],
+    departure_time: str = "now",
+    max_alternatives: int = 3
+) -> Dict:
+    """origin/destination: (lon, lat)"""
+    require_google_key()
+    try:
+        ts = _gmaps_departure_timestamp(departure_time)
         params = {
-            'origin': origin,
-            'destination': destination,
-            'mode': 'transit',
-            'departure_time': departure_timestamp,
-            'alternatives': 'true',
-            'transit_mode': 'bus|subway|train|tram',
-            'key': GOOGLE_API_KEY
+            "origin": f"{origin[1]},{origin[0]}",
+            "destination": f"{destination[1]},{destination[0]}",
+            "mode": "transit",
+            "departure_time": ts,
+            "alternatives": "true",
+            "transit_mode": "bus|subway|train|tram",
+            "transit_routing_preference": "fewer_transfers",
+            "key": GOOGLE_API_KEY,
         }
-        
-        response = requests.get(url, params=params, timeout=30)
-        response.raise_for_status()
-        data = response.json()
-        
-        if data.get('status') != 'OK':
-            return {"error": data.get('error_message', f"API Status: {data.get('status')}")}
-        
+        r = requests.get(GMAPS_DIRECTIONS_URL, params=params, timeout=30)
+        data = r.json()
+        if data.get("status") != "OK":
+            return {"error": data.get("error_message", f"Google Directions status: {data.get('status')}")}
         routes = []
-        if 'routes' in data and data['routes']:
-            for idx, route_data in enumerate(data['routes']):
-                route = parse_google_transit_route(route_data, idx)
-                if route:
-                    routes.append(route)
-        
-        return {"routes": routes, "service": "Google Maps"}
-        
+        for idx, rd in enumerate(data.get("routes", [])[:max_alternatives]):
+            parsed = parse_google_transit_route(rd, idx)
+            if parsed: routes.append(parsed)
+        if not routes: return {"error": "No transit routes found"}
+        return {"routes": routes, "service": "Google Maps Transit", "total_routes": len(routes)}
     except Exception as e:
+        logger.error(f"Google Directions error: {e}")
         return {"error": str(e)}
 
-def parse_google_transit_route(route_data, route_index):
-    """Parse Google transit route"""
+def parse_google_transit_route(route_data: Dict, route_index: int) -> Optional[Dict]:
     try:
-        legs = route_data.get('legs', [])
-        if not legs:
-            return None
-        
+        legs = route_data.get("legs", [])
+        if not legs: return None
         leg = legs[0]
-        
-        duration_seconds = leg['duration']['value']
-        duration_minutes = round(duration_seconds / 60, 1)
-        
-        distance_meters = leg['distance']['value']
-        distance_miles = round(distance_meters * 0.000621371, 2)
-        
-        departure_time = leg.get('departure_time', {})
-        arrival_time = leg.get('arrival_time', {})
-        
-        # Extract route geometry
-        overview_polyline = route_data.get('overview_polyline', {}).get('points', '')
-        route_geometry = {
-            "type": "LineString",
-            "coordinates": decode_polyline(overview_polyline) if overview_polyline else []
-        }
-        
-        # Parse steps for transit details
+
+        dur_s = leg.get("duration", {}).get("value", 0)
+        dur_min = round(dur_s / 60.0, 1)
+        dist_m = leg.get("distance", {}).get("value", 0)
+        dist_mi = round(dist_m * 0.000621371, 2)
+        dep_ts = leg.get("departure_time", {}).get("value")
+        arr_ts = leg.get("arrival_time", {}).get("value")
+
+        steps_raw = leg.get("steps", [])
         steps = []
-        transit_lines = []
-        
-        for step_idx, step in enumerate(leg.get('steps', [])):
-            parsed_step = parse_transit_step(step, step_idx)
-            if parsed_step:
-                steps.append(parsed_step)
-                if parsed_step['travel_mode'] == 'TRANSIT':
-                    if parsed_step.get('transit_line'):
-                        transit_lines.append(parsed_step['transit_line'])
-        
-        # Count transfers
-        transit_steps = [s for s in steps if s['travel_mode'] == 'TRANSIT']
-        transfers = max(0, len(transit_steps) - 1)
-        
+        route_geometry: List[List[float]] = []
+        transit_boardings = 0
+        walk_m = 0.0
+
+        for i, s in enumerate(steps_raw):
+            ps = parse_transit_step(s, i)
+            if ps:
+                steps.append(ps)
+                if ps["travel_mode"] == "TRANSIT":
+                    transit_boardings += 1
+                if ps["travel_mode"] == "WALKING":
+                    # ps has distance_miles; recompute meters from raw
+                    walk_m += s.get("distance", {}).get("value", 0)
+            if s.get("polyline", {}).get("points"):
+                route_geometry.extend(decode_polyline_to_lonlat(s["polyline"]["points"]))
+
+        transfers = max(0, transit_boardings - 1)
         return {
             "route_number": route_index + 1,
-            "name": f"Transit Route {route_index + 1}",
-            "duration_minutes": duration_minutes,
-            "duration_text": format_time_duration(duration_minutes),
-            "distance_miles": distance_miles,
-            "departure_time": departure_time.get('text', 'Unknown'),
-            "arrival_time": arrival_time.get('text', 'Unknown'),
+            "name": f"Transit Route {route_index + 1}" + (f" ({transfers} transfers)" if transfers else ""),
+            "duration_minutes": dur_min,
+            "duration_text": format_time_duration(dur_min),
+            "distance_miles": dist_mi,
+            "departure_time": parse_epoch_to_hhmm(dep_ts),
+            "arrival_time": parse_epoch_to_hhmm(arr_ts),
             "transfers": transfers,
-            "transit_lines": list(set(transit_lines)),
+            "walking_distance_miles": round(walk_m * 0.000621371, 2),
+            "route_geometry": route_geometry,
             "steps": steps,
-            "geometry": route_geometry,
+            "service": "Google Maps Transit",
         }
-        
-    except:
-        return None
-
-def parse_transit_step(step, step_index):
-    """Parse individual transit step"""
-    try:
-        travel_mode = step.get('travel_mode', 'UNKNOWN')
-        
-        # Clean HTML instructions
-        instruction = step.get('html_instructions', '')
-        import re
-        instruction = re.sub(r'<[^>]+>', '', instruction)
-        
-        step_data = {
-            "step_number": step_index + 1,
-            "travel_mode": travel_mode,
-            "instruction": instruction,
-            "duration_text": step['duration']['text'],
-            "distance_miles": round(step['distance']['value'] * 0.000621371, 2)
-        }
-        
-        if travel_mode == 'TRANSIT' and 'transit_details' in step:
-            transit = step['transit_details']
-            line = transit.get('line', {})
-            
-            step_data.update({
-                "transit_line": line.get('short_name', line.get('name', 'Transit')),
-                "departure_stop_name": transit.get('departure_stop', {}).get('name', 'Stop'),
-                "arrival_stop_name": transit.get('arrival_stop', {}).get('name', 'Stop'),
-                "scheduled_departure": transit.get('departure_time', {}).get('text', ''),
-                "scheduled_arrival": transit.get('arrival_time', {}).get('text', ''),
-            })
-        
-        return step_data
-    except:
-        return None
-
-# =============================================================================
-# MAIN ANALYSIS FUNCTIONS
-# =============================================================================
-
-def create_simple_bus_stops(point_coords, max_stops=2):
-    """Create simple mock bus stops for demonstration"""
-    stops = []
-    offsets = [0.004, 0.008, 0.012]
-    names = ["Transit Center", "Main Station", "Local Stop"]
-    
-    for i in range(min(max_stops, 3)):
-        offset = offsets[i]
-        stops.append({
-            "id": f"stop_{i+1}",
-            "name": names[i],
-            "display_x": point_coords[0] + offset,
-            "display_y": point_coords[1] + offset,
-            "distance_meters": (i + 1) * 500,
-        })
-    
-    return stops
-
-def analyze_multimodal_routes(start_point, end_point, departure_time="now", num_bike_routes=4):
-    """Main analysis function"""
-    try:
-        routes = []
-        
-        # Create multiple bike routes
-        bike_routes = create_multiple_bike_routes(start_point, end_point, num_bike_routes)
-        
-        # Add bike routes to results
-        colors = ["#e74c3c", "#3498db", "#f39c12", "#9b59b6", "#27ae60", "#e67e22"]
-        for i, bike_route in enumerate(bike_routes):
-            route_color = colors[i % len(colors)]
-            
-            route = {
-                "id": len(routes) + 1,
-                "name": bike_route['name'],
-                "type": "direct_bike",
-                "summary": {
-                    "total_time_minutes": bike_route['travel_time_minutes'],
-                    "total_time_formatted": bike_route['travel_time_formatted'],
-                    "total_distance_miles": bike_route['length_miles'],
-                    "bike_distance_miles": bike_route['length_miles'],
-                    "bike_score": bike_route.get('overall_score', 70),
-                    "transfers": 0,
-                },
-                "legs": [{
-                    "type": "bike",
-                    "name": bike_route['name'],
-                    "route": bike_route,
-                    "color": route_color
-                }],
-                "color": route_color
-            }
-            routes.append(route)
-        
-        # Add transit routes if Google Maps API is available
-        if is_valid_google_api_key():
-            # Create mock bus stops
-            start_stops = create_simple_bus_stops(start_point, 2)
-            end_stops = create_simple_bus_stops(end_point, 2)
-            
-            # Get direct transit routes
-            origin_str = f"{start_point[1]},{start_point[0]}"
-            dest_str = f"{end_point[1]},{end_point[0]}"
-            
-            transit_result = get_google_transit_routes(origin_str, dest_str, departure_time)
-            
-            if transit_result.get('routes'):
-                for i, transit_route in enumerate(transit_result['routes']):
-                    route = {
-                        "id": len(routes) + 1,
-                        "name": f"Transit Route {i + 1}",
-                        "type": "transit_only",
-                        "summary": {
-                            "total_time_minutes": transit_route['duration_minutes'],
-                            "total_time_formatted": transit_route['duration_text'],
-                            "total_distance_miles": transit_route['distance_miles'],
-                            "bike_distance_miles": 0,
-                            "bike_score": 0,
-                            "transfers": transit_route.get('transfers', 0),
-                        },
-                        "legs": [{
-                            "type": "transit",
-                            "name": f"Transit Route {i + 1}",
-                            "route": transit_route,
-                            "color": "#2196f3"
-                        }]
-                    }
-                    routes.append(route)
-        
-        # Sort routes by total time
-        routes.sort(key=lambda x: x['summary']['total_time_minutes'])
-        
-        # Calculate statistics
-        bike_only = len([r for r in routes if r['type'] == 'direct_bike'])
-        transit_only = len([r for r in routes if r['type'] == 'transit_only'])
-        
-        return {
-            "success": True,
-            "routes": routes,
-            "statistics": {
-                "total_options": len(routes),
-                "bike_only_options": bike_only,
-                "transit_only_options": transit_only,
-                "fastest_time": routes[0]['summary']['total_time_formatted'] if routes else None
-            },
-            "google_maps_enabled": is_valid_google_api_key(),
-            "timestamp": datetime.datetime.now().isoformat()
-        }
-        
     except Exception as e:
-        return {"error": str(e)}
+        logger.error(f"Parse Google route error: {e}")
+        return None
+
+def parse_transit_step(step: Dict, index: int) -> Optional[Dict]:
+    try:
+        mode = step.get("travel_mode", "UNKNOWN").upper()
+        dur_s = step.get("duration", {}).get("value", 0)
+        dist_m = step.get("distance", {}).get("value", 0)
+        base = {
+            "step_number": index + 1,
+            "travel_mode": mode,
+            "duration_minutes": round(dur_s / 60.0, 1),
+            "duration_text": format_time_duration(dur_s / 60.0),
+            "distance_miles": round(dist_m * 0.000621371, 2),
+        }
+        if mode == "TRANSIT":
+            td = step.get("transit_details", {}) or {}
+            dep = td.get("departure_stop", {}) or {}
+            arr = td.get("arrival_stop", {}) or {}
+            line = td.get("line", {}) or {}
+            base.update({
+                "transit_line": line.get("short_name") or line.get("name") or "Transit",
+                "departure_stop_name": dep.get("name", "Stop"),
+                "departure_stop_location": dep.get("location", {}),
+                "arrival_stop_name": arr.get("name", "Stop"),
+                "arrival_stop_location": arr.get("location", {}),
+                "headsign": td.get("headsign", ""),
+                "num_stops": td.get("num_stops", 0),
+            })
+        return base
+    except Exception as e:
+        logger.error(f"Parse step error: {e}")
+        return None
+
+def find_nearby_transit_stations_google(point_coords: List[float], radius_meters: int = 800, max_results: int = 6):
+    """point_coords: [lon, lat]"""
+    require_google_key()
+    try:
+        params = {
+            "location": f"{point_coords[1]},{point_coords[0]}",
+            "radius": radius_meters,
+            "type": "transit_station",
+            "key": GOOGLE_API_KEY,
+        }
+        r = requests.get(GMAPS_PLACES_NEARBY_URL, params=params, timeout=15)
+        data = r.json()
+        status = data.get("status", "UNKNOWN")
+        if status not in ("OK", "ZERO_RESULTS"):
+            logger.warning(f"Places nearby status: {status} – {data.get('error_message')}")
+            return []
+        results = data.get("results", [])[:max_results]
+        out = []
+        for item in results:
+            loc = (item.get("geometry", {}) or {}).get("location", {})
+            out.append({
+                "id": item.get("place_id", ""),
+                "name": item.get("name", "Transit Station"),
+                "x": loc.get("lng"),
+                "y": loc.get("lat"),
+                "display_x": loc.get("lng"),
+                "display_y": loc.get("lat"),
+            })
+        return out
+    except Exception as e:
+        logger.error(f"Places Nearby error: {e}")
+        return []
 
 # =============================================================================
-# FASTAPI ENDPOINTS
+# ANALYSIS: Build Bike–Bus–Bike & fallbacks
+# =============================================================================
+
+def _euclid_meters(a: Tuple[float, float], b: Tuple[float, float]) -> float:
+    # (lon,lat) → rough meters
+    dx = (a[0] - b[0]) * 111000 * math.cos(math.radians((a[1] + b[1]) / 2.0))
+    dy = (a[1] - b[1]) * 111000
+    return math.hypot(dx, dy)
+
+def should_use_transit_fallback(start_point, end_point, start_stops, end_stops, threshold_m=400):
+    try:
+        if not start_stops or not end_stops: return False
+        s = start_stops[0]; e = end_stops[0]
+        d1 = _euclid_meters(tuple(start_point), (s["display_x"], s["display_y"]))
+        d2 = _euclid_meters(tuple(end_point), (e["display_x"], e["display_y"]))
+        return (d1 < threshold_m and d2 < threshold_m)
+    except Exception:
+        return False
+
+def analyze_complete_bike_bus_bike_routes(start_point: List[float], end_point: List[float], departure_time="now"):
+    """
+    start_point / end_point: [lon, lat]
+    Returns route options: bike–bus–bike, transit-only fallback, and direct bike comparator.
+    """
+    routes = []
+
+    # Nearby stations
+    start_stops = find_nearby_transit_stations_google(start_point, radius_meters=800, max_results=4)
+    end_stops   = find_nearby_transit_stations_google(end_point,   radius_meters=800, max_results=4)
+
+    # Transit fallback if both bike legs would be tiny
+    fallback_used = should_use_transit_fallback(start_point, end_point, start_stops, end_stops)
+    if fallback_used:
+        tr = get_transit_routes_google(tuple(start_point), tuple(end_point), departure_time)
+        if tr.get("routes"):
+            for i, r in enumerate(tr["routes"]):
+                routes.append({
+                    "id": len(routes)+1, "name": f"Transit Option {i+1}",
+                    "type": "transit_fallback",
+                    "summary": {
+                        "total_time_minutes": r["duration_minutes"],
+                        "total_time_formatted": r["duration_text"],
+                        "total_distance_miles": r["distance_miles"],
+                        "bike_distance_miles": 0.0, "transit_distance_miles": r["distance_miles"],
+                        "bike_percentage": 0.0, "average_bike_score": 0.0,
+                        "transfers": r.get("transfers", 0), "total_fare": 0,
+                        "departure_time": r.get("departure_time", "Unknown"),
+                        "arrival_time": r.get("arrival_time", "Unknown"),
+                    },
+                    "legs": [{
+                        "type": "transit", "name": f"Google Transit Route {i+1}",
+                        "description": "Direct transit (smart fallback)",
+                        "route": r, "color": "#2196f3", "order": 1
+                    }],
+                    "fallback_reason": "Both bike segments < 400m"
+                })
+
+    # Bike → Transit → Bike
+    if start_stops and end_stops:
+        s = start_stops[0]; e = end_stops[0]
+        # ensure distinct
+        if s["id"] == e["id"]:
+            if len(end_stops) > 1: e = end_stops[1]
+            elif len(start_stops) > 1: e = start_stops[1]
+        if s["id"] != e["id"]:
+            bike1 = calculate_bike_route_osrm(start_point, [s["display_x"], s["display_y"]], "Start to Station")
+            bike2 = calculate_bike_route_osrm([e["display_x"], e["display_y"]], end_point, "Station to Destination")
+            if bike1 and bike2:
+                tr = get_transit_routes_google((s["display_x"], s["display_y"]), (e["display_x"], e["display_y"]), departure_time)
+                if tr.get("routes"):
+                    for i, r in enumerate(tr["routes"]):
+                        total_bike_mi = bike1["length_miles"] + bike2["length_miles"]
+                        total_transit_mi = r["distance_miles"]
+                        total_mi = total_bike_mi + total_transit_mi
+                        # +5 min buffer for transfers
+                        total_time = bike1["travel_time_minutes"] + r["duration_minutes"] + bike2["travel_time_minutes"] + 5.0
+                        # length-weighted bike score
+                        bike_score = 0.0
+                        if total_bike_mi > 0:
+                            bike_score = (bike1["overall_score"]*bike1["length_miles"] + bike2["overall_score"]*bike2["length_miles"]) / total_bike_mi
+                        r_enh = dict(r); r_enh["start_stop"] = s; r_enh["end_stop"] = e
+                        routes.append({
+                            "id": len(routes)+1, "name": f"Bike–Bus–Bike Option {i+1}", "type": "bike_bus_bike",
+                            "summary": {
+                                "total_time_minutes": round(total_time, 1),
+                                "total_time_formatted": format_time_duration(total_time),
+                                "total_distance_miles": round(total_mi, 2),
+                                "bike_distance_miles": round(total_bike_mi, 2),
+                                "transit_distance_miles": round(total_transit_mi, 2),
+                                "bike_percentage": round((total_bike_mi/total_mi)*100, 1) if total_mi>0 else 0.0,
+                                "average_bike_score": round(bike_score, 1),
+                                "transfers": r.get("transfers", 0), "total_fare": 0,
+                                "departure_time": r.get("departure_time", "Unknown"),
+                                "arrival_time": r.get("arrival_time", "Unknown"),
+                            },
+                            "legs": [
+                                {"type":"bike","name":"OSRM Bike to Station","description":f"Bike to {s['name']}","route":bike1,"color":"#27ae60","order":1},
+                                {"type":"transit","name":"Google Transit","description":f"Transit {s['name']} → {e['name']}","route":r_enh,"color":"#3498db","order":2},
+                                {"type":"bike","name":"OSRM Station to Destination","description":f"Bike from {e['name']}","route":bike2,"color":"#27ae60","order":3},
+                            ]
+                        })
+
+    # Direct bike comparator
+    direct_bike = calculate_bike_route_osrm(start_point, end_point, "Direct OSRM Bike Route")
+    if direct_bike:
+        routes.append({
+            "id": len(routes)+1, "name": "Direct OSRM Bike Route", "type": "direct_bike",
+            "summary": {
+                "total_time_minutes": direct_bike["travel_time_minutes"],
+                "total_time_formatted": direct_bike["travel_time_formatted"],
+                "total_distance_miles": direct_bike["length_miles"],
+                "bike_distance_miles": direct_bike["length_miles"],
+                "transit_distance_miles": 0.0,
+                "bike_percentage": 100.0,
+                "average_bike_score": direct_bike["overall_score"],
+                "transfers": 0, "total_fare": 0,
+                "departure_time": "Immediate", "arrival_time": "Flexible",
+            },
+            "legs": [{"type":"bike","name":"Direct OSRM Bike Route","description":"Complete OSRM bike route","route":direct_bike,"color":"#e74c3c","order":1}]
+        })
+
+    if not routes:
+        raise HTTPException(status_code=400, detail="No routes found")
+
+    routes.sort(key=lambda x: x["summary"]["total_time_minutes"])
+    return {
+        "success": True,
+        "analysis_type": "osrm_google_transit",
+        "fallback_used": fallback_used,
+        "routing_engine": "OSRM + Google Transit",
+        "routes": routes,
+        "bus_stops": {"start_stops": start_stops, "end_stops": end_stops},
+        "statistics": {
+            "total_options": len(routes),
+            "bike_bus_bike_options": len([r for r in routes if r["type"] == "bike_bus_bike"]),
+            "direct_bike_options": len([r for r in routes if r["type"] == "direct_bike"]),
+            "transit_fallback_options": len([r for r in routes if r["type"] == "transit_fallback"]),
+            "fastest_option": routes[0]["name"],
+            "fastest_time": routes[0]["summary"]["total_time_formatted"],
+        },
+        "bike_speed_mph": BIKE_SPEED_MPH,
+        "osrm_server": OSRM_SERVER,
+        "google_service": "Directions + Places",
+        "analysis_timestamp": datetime.datetime.now().isoformat(),
+    }
+
+# =============================================================================
+# ENDPOINTS
 # =============================================================================
 
 @app.get("/", response_class=HTMLResponse)
-async def get_home():
-    """Serve the main UI"""
+async def ui():
+    # Lightweight, self-contained Leaflet UI
     return """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Multi-Route Bike-Transit Planner</title>
-        <meta charset="utf-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
-        <style>
-            body { margin: 0; font-family: 'Segoe UI', sans-serif; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height: 100vh; }
-            .header { background: linear-gradient(135deg, #2c3e50, #3498db); color: white; padding: 20px; text-align: center; box-shadow: 0 4px 20px rgba(0,0,0,0.3); }
-            .header h1 { margin: 0; font-size: 2.2em; font-weight: 300; }
-            .container { display: flex; height: calc(100vh - 100px); max-width: 1400px; margin: 0 auto; background: white; border-radius: 10px 10px 0 0; overflow: hidden; box-shadow: 0 -5px 20px rgba(0,0,0,0.1); }
-            #map { flex: 2.5; }
-            .sidebar { flex: 1; max-width: 400px; padding: 20px; background: #f8f9fa; overflow-y: auto; border-left: 1px solid #dee2e6; }
-            
-            .status { padding: 12px; border-radius: 8px; margin-bottom: 15px; text-align: center; font-weight: 500; font-size: 0.9em; }
-            .status-good { background: linear-gradient(135deg, #d4edda, #c3e6cb); color: #155724; }
-            .status-limited { background: linear-gradient(135deg, #fff3cd, #ffeaa7); color: #856404; }
-            
-            .controls { background: white; padding: 15px; border-radius: 8px; margin-bottom: 15px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-            .form-group { margin-bottom: 15px; }
-            label { display: block; margin-bottom: 5px; font-weight: 600; color: #333; }
-            select { width: 100%; padding: 8px 12px; border: 2px solid #e1e5e9; border-radius: 6px; font-size: 1em; }
-            select:focus { outline: none; border-color: #3498db; }
-            
-            button { background: linear-gradient(135deg, #3498db, #2980b9); color: white; padding: 12px 20px; border: none; border-radius: 6px; cursor: pointer; font-size: 1em; font-weight: 600; width: 100%; margin: 5px 0; }
-            button:hover:not(:disabled) { transform: translateY(-1px); box-shadow: 0 4px 12px rgba(52, 152, 219, 0.3); }
-            button:disabled { background: #bdc3c7; cursor: not-allowed; }
-            .btn-clear { background: linear-gradient(135deg, #e74c3c, #c0392b); }
-            
-            .coordinates { background: #f8f9fa; padding: 12px; border-radius: 6px; margin: 10px 0; border-left: 4px solid #6c757d; font-size: 13px; }
-            .spinner { border: 3px solid rgba(52, 152, 219, 0.2); width: 30px; height: 30px; border-radius: 50%; border-left-color: #3498db; animation: spin 1s linear infinite; margin: 15px auto; display: none; }
-            @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
-            
-            .route-toggles { margin-bottom: 15px; }
-            .route-toggle { cursor: pointer; margin: 5px 0; padding: 10px; background: #e9ecef; border-radius: 6px; display: flex; align-items: center; transition: all 0.2s; }
-            .route-toggle.active { background: #007cba; color: white; }
-            .route-toggle:hover { transform: translateY(-1px); }
-            .route-color { width: 16px; height: 16px; border-radius: 3px; margin-right: 10px; }
-            
-            .route-card { background: white; border-radius: 8px; padding: 15px; margin-bottom: 15px; box-shadow: 0 3px 10px rgba(0,0,0,0.1); border: 2px solid #e9ecef; }
-            .route-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
-            .route-name { font-weight: 700; color: #2c3e50; font-size: 1.1em; }
-            .route-type { padding: 4px 8px; border-radius: 12px; font-size: 0.75em; font-weight: 600; }
-            .type-bike { background: #27ae60; color: white; }
-            .type-transit { background: #2196f3; color: white; }
-            
-            .route-stats { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; margin-top: 10px; }
-            .stat { text-align: center; padding: 8px; background: #f8f9fa; border-radius: 4px; }
-            .stat-value { font-weight: bold; color: #3498db; display: block; }
-            .stat-label { font-size: 0.75em; color: #6c757d; text-transform: uppercase; }
-            
-            .error { background: linear-gradient(135deg, #ffebee, #ffcdd2); color: #c62828; padding: 15px; border-radius: 8px; margin: 15px 0; }
-            .hidden { display: none; }
-        </style>
-    </head>
-    <body>
-        <div class="header">
-            <h1>Multi-Route Bike-Transit Planner</h1>
-            <p>OSRM bicycle routing + Google Maps transit integration</p>
+<!DOCTYPE html>
+<html>
+<head>
+  <title>OSRM + Google Transit Bike–Bus–Bike Planner</title>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <style>
+    body { margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; }
+    .header { background:#2c3e50; color:#fff; padding:14px 16px; }
+    .container { display:flex; height: calc(100vh - 60px); }
+    #map { flex:2; }
+    .sidebar { flex:1; max-width:420px; padding:16px; background:#f8f9fa; overflow:auto; }
+    .controls { margin-bottom:12px; }
+    label { display:block; margin: 8px 0 4px; font-weight:600; }
+    select, input { width:100%; padding:8px; }
+    button { width:100%; padding:12px; margin-top:10px; background:#3498db; color:#fff; border:none; border-radius:4px; }
+    button:disabled { background:#bbb; }
+    .btn-clear{ background:#e74c3c; }
+    .route-card{ background:#fff; border:1px solid #ddd; border-radius:8px; padding:12px; margin:10px 0; cursor:pointer; }
+    .route-card.selected{ border-color:#3498db; background:#f5faff; }
+    .route-summary{ display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-top:8px; }
+    .summary-item{ background:#f1f3f4; border-radius:4px; text-align:center; padding:8px; }
+    .summary-value{ font-weight:700; color:#3498db; }
+    .coords{ font-size:12px; color:#555; background:#eef1f4; padding:6px; border-radius:4px; margin-top:8px; }
+    .spinner{ border:3px solid #f3f3f3; border-top:3px solid #3498db; border-radius:50%; width:28px;height:28px; animation: spin 1s linear infinite; display:none; margin:16px auto;}
+    @keyframes spin{0%{transform:rotate(0)}100%{transform:rotate(360deg)}}
+  </style>
+</head>
+<body>
+  <div class="header"><h2>OSRM + Google Transit Bike–Bus–Bike Planner</h2></div>
+  <div class="container">
+    <div id="map"></div>
+    <div class="sidebar">
+      <div class="controls">
+        <label>Departure Time</label>
+        <select id="departureTime">
+          <option value="now">Leave Now</option>
+          <option value="custom">Custom</option>
+        </select>
+        <div id="customTimeGroup" style="display:none;">
+          <label>Select Time</label>
+          <input type="datetime-local" id="customTime">
         </div>
-        
-        <div class="container">
-            <div id="map"></div>
-            
-            <div class="sidebar">
-                <div class="status" id="status">System: Loading...</div>
-                
-                <div class="controls">
-                    <div class="form-group">
-                        <label for="routeCount">Number of Bike Routes:</label>
-                        <select id="routeCount">
-                            <option value="3">3 Routes</option>
-                            <option value="4" selected>4 Routes</option>
-                            <option value="5">5 Routes</option>
-                        </select>
-                    </div>
-                    
-                    <button id="findRoutesBtn" disabled onclick="findRoutes()">Find Routes</button>
-                    <button class="btn-clear" onclick="clearAll()">Clear Map</button>
-                    
-                    <div class="coordinates">
-                        <div><strong>Start:</strong> <span id="startCoords">Click map to select</span></div>
-                        <div><strong>End:</strong> <span id="endCoords">Click map to select</span></div>
-                    </div>
-                </div>
-                
-                <div class="spinner" id="spinner"></div>
-                <div id="routeToggles" class="route-toggles"></div>
-                <div id="results"></div>
-            </div>
+        <button id="findRoutesBtn" disabled>Find Routes</button>
+        <button class="btn-clear" id="clearBtn">Clear Map</button>
+        <div class="coords">
+          <div><b>Start:</b> <span id="startCoords">Click map</span></div>
+          <div><b>End:</b> <span id="endCoords">Click map</span></div>
         </div>
+      </div>
+      <div class="spinner" id="spinner"></div>
+      <div id="results"></div>
+    </div>
+  </div>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    let map = L.map('map').setView([30.3322,-81.6557], 12);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{attribution:'© OpenStreetMap'}).addTo(map);
+    let start = null, endp = null, startMarker=null, endMarker=null, routeLayers=L.layerGroup().addTo(map);
+    let currentRoutes = [];
 
-        <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-        <script>
-            let map, startPoint = null, endPoint = null, startMarker = null, endMarker = null;
-            let routeLayers = new Map();
-            let currentRoutes = [];
+    const depSel = document.getElementById('departureTime');
+    const customGroup = document.getElementById('customTimeGroup');
+    const customInput = document.getElementById('customTime');
+    depSel.addEventListener('change', ()=> {
+      if (depSel.value==='custom'){ customGroup.style.display='block'; const n=new Date(); n.setMinutes(n.getMinutes()-n.getTimezoneOffset()); customInput.value=n.toISOString().slice(0,16);}
+      else customGroup.style.display='none';
+    });
 
-            function initMap() {
-                map = L.map('map').setView([30.3322, -81.6557], 12);
-                L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png').addTo(map);
-                map.on('click', handleMapClick);
-                loadSystemStatus();
+    map.on('click', (e)=>{
+      const lat=e.latlng.lat, lon=e.latlng.lng;
+      if (!start){ if(startMarker) map.removeLayer(startMarker); start=[lon,lat]; startMarker=L.marker([lat,lon]).addTo(map).bindPopup('Start').openPopup(); document.getElementById('startCoords').textContent=lat.toFixed(5)+', '+lon.toFixed(5); }
+      else if(!endp){ if(endMarker) map.removeLayer(endMarker); endp=[lon,lat]; endMarker=L.marker([lat,lon]).addTo(map).bindPopup('End').openPopup(); document.getElementById('endCoords').textContent=lat.toFixed(5)+', '+lon.toFixed(5); document.getElementById('findRoutesBtn').disabled=false; }
+      else { clearAll(); map.fire('click', e); }
+    });
+
+    document.getElementById('clearBtn').onclick = clearAll;
+    function clearAll(){
+      if(startMarker){map.removeLayer(startMarker);} if(endMarker){map.removeLayer(endMarker);}
+      startMarker=null; endMarker=null; start=null; endp=null; routeLayers.clearLayers();
+      document.getElementById('startCoords').textContent='Click map'; document.getElementById('endCoords').textContent='Click map';
+      document.getElementById('findRoutesBtn').disabled=true; document.getElementById('results').innerHTML='';
+    }
+
+    function spin(v){ document.getElementById('spinner').style.display = v?'block':'none'; }
+
+    document.getElementById('findRoutesBtn').onclick = async ()=>{
+      if(!start || !endp) return;
+      spin(true); routeLayers.clearLayers();
+      let dep = (depSel.value==='custom' && customInput.value) ? Math.floor(new Date(customInput.value).getTime()/1000) : 'now';
+      const qs = new URLSearchParams({ start_lon:start[0], start_lat:start[1], end_lon:endp[0], end_lat:endp[1], departure_time: dep });
+      const res = await fetch('/api/analyze?'+qs.toString()); const data = await res.json(); spin(false);
+      if(!res.ok){ document.getElementById('results').innerHTML = '<div style="color:#a00;background:#fee;padding:8px;border-radius:6px;">'+(data.detail||'Analysis failed')+'</div>'; return; }
+      currentRoutes = data.routes; renderResults(data); if(currentRoutes.length>0) selectRoute(0);
+    };
+
+    function renderResults(data){
+      let html = '<h3>Found '+data.routes.length+' options</h3>';
+      if(data.fallback_used){ html += '<div style="background:#e3f2fd;padding:8px;border-radius:6px;margin:8px 0;">Smart fallback: transit-only used.</div>'; }
+      data.routes.forEach((r, idx)=>{
+        html += '<div class="route-card" id="rc'+idx+'" onclick="selectRoute('+idx+')">'+
+                '<div><b>'+r.name+'</b></div>'+
+                '<div class="route-summary">'+
+                '<div class="summary-item"><div class="summary-value">'+r.summary.total_time_formatted+'</div><div>Total Time</div></div>'+
+                '<div class="summary-item"><div class="summary-value">'+(r.summary.total_distance_miles||0).toFixed(1)+' mi</div><div>Distance</div></div>'+
+                '</div></div>';
+      });
+      document.getElementById('results').innerHTML = html;
+    }
+
+    window.selectRoute = function(index){
+      document.querySelectorAll('.route-card').forEach(x=>x.classList.remove('selected'));
+      const card = document.getElementById('rc'+index); if(card) card.classList.add('selected');
+      routeLayers.clearLayers();
+      const r = currentRoutes[index];
+      const colors = {'bike':'#27ae60','transit':'#3498db'};
+      (r.legs||[]).forEach(leg=>{
+        if(leg.type==='bike' && leg.route.geometry){
+          const coords = leg.route.geometry.coordinates.map(c=>[c[1],c[0]]);
+          L.polyline(coords,{color:colors.bike,weight:5,opacity:0.9}).addTo(routeLayers);
+        } else if(leg.type==='transit'){
+          const coords = (leg.route.route_geometry||[]).map(c=>[c[1],c[0]]);
+          if(coords.length) L.polyline(coords,{color:colors.transit,weight:5,opacity:0.9,dashArray:'10,5'}).addTo(routeLayers);
+          (leg.route.steps||[]).forEach(s=>{
+            if(s.travel_mode==='TRANSIT' && s.departure_stop_location && s.departure_stop_location.lat!==undefined){
+              L.marker([s.departure_stop_location.lat, s.departure_stop_location.lng]).addTo(routeLayers)
+               .bindPopup('Departure: '+(s.departure_stop_name||'Stop'));
+              if(s.arrival_stop_location && s.arrival_stop_location.lat!==undefined){
+                L.marker([s.arrival_stop_location.lat, s.arrival_stop_location.lng]).addTo(routeLayers)
+                 .bindPopup('Arrival: '+(s.arrival_stop_name||'Stop'));
+              }
             }
-
-            async function loadSystemStatus() {
-                try {
-                    const response = await fetch('/health');
-                    const data = await response.json();
-                    const statusDiv = document.getElementById('status');
-                    
-                    if (data.google_maps_enabled) {
-                        statusDiv.className = 'status status-good';
-                        statusDiv.innerHTML = 'System: OSRM + Google Maps Ready';
-                    } else {
-                        statusDiv.className = 'status status-limited';
-                        statusDiv.innerHTML = 'System: OSRM Only (Bike routes available)';
-                    }
-                } catch (error) {
-                    document.getElementById('status').innerHTML = 'System: Connection issues';
-                }
-            }
-
-            function handleMapClick(e) {
-                if (!startPoint) {
-                    startPoint = e.latlng;
-                    startMarker = L.marker(startPoint, {
-                        icon: L.icon({
-                            iconUrl: 'https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-green.png',
-                            iconSize: [25, 41], iconAnchor: [12, 41]
-                        })
-                    }).addTo(map).bindTooltip("Start", {permanent: true, direction: 'top'});
-                    updateCoords();
-                } else if (!endPoint) {
-                    endPoint = e.latlng;
-                    endMarker = L.marker(endPoint, {
-                        icon: L.icon({
-                            iconUrl: 'https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-red.png',
-                            iconSize: [25, 41], iconAnchor: [12, 41]
-                        })
-                    }).addTo(map).bindTooltip("End", {permanent: true, direction: 'top'});
-                    updateCoords();
-                } else {
-                    clearAll();
-                    handleMapClick(e);
-                }
-            }
-
-            function updateCoords() {
-                document.getElementById('startCoords').textContent = 
-                    startPoint ? `${startPoint.lat.toFixed(4)}, ${startPoint.lng.toFixed(4)}` : 'Click map to select';
-                document.getElementById('endCoords').textContent = 
-                    endPoint ? `${endPoint.lat.toFixed(4)}, ${endPoint.lng.toFixed(4)}` : 'Click map to select';
-                document.getElementById('findRoutesBtn').disabled = !(startPoint && endPoint);
-            }
-
-            function clearAll() {
-                startPoint = null; endPoint = null;
-                if (startMarker) map.removeLayer(startMarker);
-                if (endMarker) map.removeLayer(endMarker);
-                clearAllRoutes();
-                document.getElementById('results').innerHTML = '';
-                document.getElementById('routeToggles').innerHTML = '';
-                updateCoords();
-            }
-
-            function clearAllRoutes() {
-                routeLayers.forEach(layer => map.removeLayer(layer));
-                routeLayers.clear();
-            }
-
-            function toggleRoute(routeId) {
-                const layer = routeLayers.get(routeId);
-                if (layer) {
-                    if (map.hasLayer(layer)) {
-                        map.removeLayer(layer);
-                    } else {
-                        map.addLayer(layer);
-                    }
-                    updateToggleButtons();
-                }
-            }
-
-            function updateToggleButtons() {
-                document.querySelectorAll('.route-toggle').forEach(toggle => {
-                    const routeId = parseInt(toggle.dataset.routeId);
-                    const layer = routeLayers.get(routeId);
-                    toggle.classList.toggle('active', layer && map.hasLayer(layer));
-                });
-            }
-
-            function showSpinner(show) {
-                document.getElementById('spinner').style.display = show ? 'block' : 'none';
-                document.getElementById('findRoutesBtn').disabled = show;
-                document.getElementById('findRoutesBtn').innerHTML = show ? 'Finding Routes...' : 'Find Routes';
-            }
-
-            async function findRoutes() {
-                if (!startPoint || !endPoint) return;
-
-                const routeCount = document.getElementById('routeCount').value;
-                showSpinner(true);
-                clearAllRoutes();
-
-                try {
-                    const params = new URLSearchParams({
-                        start_lon: startPoint.lng,
-                        start_lat: startPoint.lat,
-                        end_lon: endPoint.lng,
-                        end_lat: endPoint.lat,
-                        num_routes: routeCount
-                    });
-
-                    const response = await fetch(`/api/analyze?${params}`);
-                    const data = await response.json();
-
-                    if (data.success) {
-                        displayResults(data);
-                    } else {
-                        document.getElementById('results').innerHTML = `<div class="error">Error: ${data.error}</div>`;
-                    }
-                } catch (error) {
-                    document.getElementById('results').innerHTML = `<div class="error">Error: ${error.message}</div>`;
-                }
-
-                showSpinner(false);
-            }
-
-            function displayResults(data) {
-                currentRoutes = data.routes;
-                clearAllRoutes();
-
-                // Create route toggles
-                let toggleHtml = '<h4>Route Visibility</h4>';
-                data.routes.forEach((route) => {
-                    const routeColor = route.color || '#3498db';
-                    toggleHtml += `<div class="route-toggle active" data-route-id="${route.id}" onclick="toggleRoute(${route.id})">
-                        <span class="route-color" style="background-color: ${routeColor};"></span>
-                        <span>${route.name}</span>
-                    </div>`;
-                });
-                document.getElementById('routeToggles').innerHTML = toggleHtml;
-
-                // Display route cards
-                let html = `<h4>Found ${data.routes.length} Routes</h4>`;
-                data.routes.forEach((route) => {
-                    html += createRouteCard(route);
-                });
-                document.getElementById('results').innerHTML = html;
-
-                // Add routes to map
-                data.routes.forEach((route) => {
-                    addRouteToMap(route);
-                });
-
-                // Fit map bounds
-                if (routeLayers.size > 0) {
-                    const group = new L.FeatureGroup(Array.from(routeLayers.values()));
-                    map.fitBounds(group.getBounds().pad(0.1));
-                }
-            }
-
-            function createRouteCard(route) {
-                let routeTypeClass, routeTypeText;
-                
-                if (route.type === 'bike_bus_bike') {
-                    routeTypeClass = 'type-bike';
-                    routeTypeText = 'MULTIMODAL';
-                } else if (route.type === 'direct_bike') {
-                    routeTypeClass = 'type-bike';
-                    routeTypeText = 'BIKE';
-                } else {
-                    routeTypeClass = 'type-transit';
-                    routeTypeText = 'TRANSIT';
-                }
-                
-                return `
-                    <div class="route-card">
-                        <div class="route-header">
-                            <div class="route-name">${route.name}</div>
-                            <span class="route-type ${routeTypeClass}">${routeTypeText}</span>
-                        </div>
-                        <div class="route-stats">
-                            <div class="stat">
-                                <span class="stat-value">${route.summary.total_time_formatted}</span>
-                                <span class="stat-label">Time</span>
-                            </div>
-                            <div class="stat">
-                                <span class="stat-value">${route.summary.total_distance_miles.toFixed(1)}</span>
-                                <span class="stat-label">Miles</span>
-                            </div>
-                            <div class="stat">
-                                <span class="stat-value">${route.summary.bike_score || 0}</span>
-                                <span class="stat-label">Score</span>
-                            </div>
-                        </div>
-                        ${route.type === 'bike_bus_bike' ? `
-                        <div style="margin-top: 10px; padding: 10px; background: #e3f2fd; border-radius: 6px; font-size: 0.85em;">
-                            <strong>Multimodal Route:</strong> ${route.summary.bike_distance_miles.toFixed(1)} mi bike + ${(route.summary.total_distance_miles - route.summary.bike_distance_miles).toFixed(1)} mi transit
-                        </div>
-                        ` : ''}
-                    </div>
-                `;
-            }
-
-            function addRouteToMap(route) {
-                const routeColor = route.color || '#3498db';
-                
-                route.legs.forEach((leg, legIndex) => {
-                    if (leg.route && leg.route.geometry && leg.route.geometry.coordinates && leg.route.geometry.coordinates.length > 0) {
-                        try {
-                            // Ensure coordinates are properly formatted [lat, lng]
-                            const coords = leg.route.geometry.coordinates.map(coord => {
-                                // Handle both [lng, lat] and [lat, lng] formats
-                                if (Array.isArray(coord) && coord.length === 2) {
-                                    const lat = typeof coord[1] === 'number' ? coord[1] : parseFloat(coord[1]);
-                                    const lng = typeof coord[0] === 'number' ? coord[0] : parseFloat(coord[0]);
-                                    
-                                    // Basic validation
-                                    if (isNaN(lat) || isNaN(lng)) {
-                                        console.warn('Invalid coordinate:', coord);
-                                        return null;
-                                    }
-                                    
-                                    // Ensure lat/lng are in valid ranges
-                                    if (lat < -90 || lat > 90 || lng < -180 || lng > 180) {
-                                        console.warn('Coordinate out of range:', coord);
-                                        return null;
-                                    }
-                                    
-                                    return [lat, lng];
-                                }
-                                return null;
-                            }).filter(coord => coord !== null);
-                            
-                            if (coords.length < 2) {
-                                console.warn('Not enough valid coordinates for leg:', leg.name);
-                                return;
-                            }
-                            
-                            const weight = leg.type === 'bike' ? 4 : 6;
-                            const dashArray = leg.type === 'transit' ? '10, 5' : null;
-                            const legColor = leg.color || routeColor;
-                            
-                            const routeLine = L.polyline(coords, {
-                                color: legColor,
-                                weight: weight,
-                                opacity: 0.8,
-                                dashArray: dashArray
-                            });
-                            
-                            // Add popup with route information
-                            const distance = leg.route.length_miles || leg.route.distance_miles || 0;
-                            const time = leg.route.travel_time_formatted || leg.route.duration_text || 'N/A';
-                            
-                            routeLine.bindPopup(`
-                                <div style="font-family: 'Segoe UI', sans-serif; max-width: 200px;">
-                                    <h4 style="margin: 0 0 8px 0; color: ${legColor};">
-                                        ${leg.type === 'bike' ? '🚴‍♂️' : '🚌'} ${leg.name}
-                                    </h4>
-                                    <p style="margin: 4px 0;"><strong>Distance:</strong> ${distance.toFixed(2)} miles</p>
-                                    <p style="margin: 4px 0;"><strong>Time:</strong> ${time}</p>
-                                    ${leg.type === 'bike' && leg.route.overall_score ? 
-                                        `<p style="margin: 4px 0;"><strong>Safety Score:</strong> ${leg.route.overall_score}</p>` : ''}
-                                    ${leg.type === 'transit' && leg.route.transit_lines ? 
-                                        `<p style="margin: 4px 0;"><strong>Lines:</strong> ${leg.route.transit_lines.join(', ')}</p>` : ''}
-                                </div>
-                            `);
-                            
-                            // Add to layer group
-                            if (!routeLayers.has(route.id)) {
-                                routeLayers.set(route.id, L.layerGroup());
-                            }
-                            routeLayers.get(route.id).addLayer(routeLine);
-                            
-                            // Add transit stop markers for transit legs
-                            if (leg.type === 'transit' && leg.route.steps) {
-                                addTransitStopsToMap(leg.route.steps, route.id);
-                            }
-                            
-                        } catch (error) {
-                            console.error('Error adding leg to map:', error, leg);
-                        }
-                    } else {
-                        console.warn('Leg missing geometry data:', leg.name);
-                    }
-                });
-                
-                // Add the complete route layer to map
-                if (routeLayers.has(route.id)) {
-                    routeLayers.get(route.id).addTo(map);
-                }
-            }
-            
-            function addTransitStopsToMap(steps, routeId) {
-                if (!steps || !Array.isArray(steps)) return;
-                
-                steps.forEach(step => {
-                    if (step.travel_mode === 'TRANSIT') {
-                        // Add departure stop if coordinates are available
-                        if (step.departure_stop_location && 
-                            typeof step.departure_stop_location.lat === 'number' && 
-                            typeof step.departure_stop_location.lng === 'number') {
-                            
-                            const stopIcon = L.divIcon({
-                                html: '<div style="width: 12px; height: 12px; background: #3498db; border: 2px solid white; border-radius: 50%;"></div>',
-                                className: 'transit-stop-marker',
-                                iconSize: [16, 16],
-                                iconAnchor: [8, 8]
-                            });
-                            
-                            const stopMarker = L.marker(
-                                [step.departure_stop_location.lat, step.departure_stop_location.lng], 
-                                { icon: stopIcon }
-                            ).bindPopup(`
-                                <div style="font-family: 'Segoe UI', sans-serif;">
-                                    <h5 style="margin: 0 0 6px 0; color: #3498db;">🚏 ${step.departure_stop_name || 'Transit Stop'}</h5>
-                                    <p style="margin: 2px 0; font-size: 0.9em;"><strong>Line:</strong> ${step.transit_line || 'N/A'}</p>
-                                    <p style="margin: 2px 0; font-size: 0.9em;"><strong>Departure:</strong> ${step.scheduled_departure || 'N/A'}</p>
-                                </div>
-                            `);
-                            
-                            if (routeLayers.has(routeId)) {
-                                routeLayers.get(routeId).addLayer(stopMarker);
-                            }
-                        }
-                    }
-                });
-            }
-
-            // Initialize
-            initMap();
-        </script>
-    </body>
-    </html>
+          });
+        }
+      });
+      try{ if(routeLayers.getLayers().length>0) map.fitBounds(routeLayers.getBounds(),{padding:[18,18]}); }catch(e){}
+    };
+  </script>
+</body>
+</html>
     """
 
 @app.get("/api/health")
-async def health_check():
-    """Health check endpoint"""
-    return {
+async def health():
+    # light connectivity flags
+    status = {
         "status": "healthy",
-        "service": "Multi-Route Bike-Transit Planner",
-        "version": "1.0.0",
-        "google_maps_enabled": is_valid_google_api_key(),
+        "google_key_present": bool(GOOGLE_API_KEY),
         "osrm_server": OSRM_SERVER,
-        "timestamp": datetime.datetime.now().isoformat()
+        "bike_speed_mph": BIKE_SPEED_MPH,
+        "time": datetime.datetime.now().isoformat()
     }
+    try:
+        requests.get(f"{OSRM_SERVER}/health", timeout=5)
+        status["osrm_reachable"] = True
+    except Exception:
+        status["osrm_reachable"] = False
+    return status
+
+@app.get("/api/stops")
+async def api_stops(lat: float, lon: float, radius_meters: int = 600):
+    try:
+        return {
+            "stops": find_nearby_transit_stations_google([lon, lat], radius_meters, max_results=10),
+            "center": {"lat": lat, "lon": lon},
+            "radius_meters": radius_meters,
+            "source": "Google Places"
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"/api/stops error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/analyze")
-async def analyze_routes(
+async def api_analyze(
     start_lon: float = Query(...),
     start_lat: float = Query(...),
     end_lon: float = Query(...),
     end_lat: float = Query(...),
-    num_routes: int = Query(4, ge=3, le=6),
     departure_time: str = Query("now")
 ):
-    """Main route analysis endpoint"""
-    
-    # Validate coordinates
-    if not (-180 <= start_lon <= 180 and -90 <= start_lat <= 90):
-        raise HTTPException(status_code=400, detail="Invalid start coordinates")
-    if not (-180 <= end_lon <= 180 and -90 <= end_lat <= 90):
-        raise HTTPException(status_code=400, detail="Invalid end coordinates")
-    
+    # basic validation
+    if not (-180 <= start_lon <= 180 and -90 <= start_lat <= 90): raise HTTPException(status_code=400, detail="Invalid start coordinates")
+    if not (-180 <= end_lon <= 180 and -90 <= end_lat <= 90): raise HTTPException(status_code=400, detail="Invalid end coordinates")
     try:
-        result = analyze_multimodal_routes(
-            [start_lon, start_lat],
-            [end_lon, end_lat],
-            departure_time,
-            num_routes
-        )
-        
-        if "error" in result:
-            raise HTTPException(status_code=500, detail=result["error"])
-        
-        return result
-        
+        return analyze_complete_bike_bus_bike_routes([start_lon, start_lat], [end_lon, end_lat], departure_time)
     except HTTPException:
         raise
     except Exception as e:
+        logger.error(f"/api/analyze error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# Health endpoint alias
-@app.get("/health")
-async def health_alias():
-    return await health_check()
+@app.on_event("startup")
+async def on_startup():
+    logger.info("Starting OSRM + Google Transit BBB API…")
+    logger.info(f"OSRM: {OSRM_SERVER}")
+    logger.info(f"Google key present: {bool(GOOGLE_API_KEY)}")
 
 if __name__ == "__main__":
-    uvicorn.run(
-        "app:app",
-        host="0.0.0.0",
-        port=PORT,
-        reload=False
-    )
+    # Run directly: uses this process' env var GOOGLE_API_KEY
+    port = int(os.getenv("PORT", "8000"))
+    uvicorn.run(app, host="0.0.0.0", port=port, reload=False, log_level="info")
