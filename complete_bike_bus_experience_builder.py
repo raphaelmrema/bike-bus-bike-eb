@@ -730,27 +730,37 @@ async def enhanced_ui():
         }
         
         function selectRoute(index) {
+            console.log('=== Selecting Route', index, '===');
             document.querySelectorAll('.route-card').forEach(card => card.classList.remove('selected'));
             const card = document.getElementById(`routeCard${index}`);
             if (card) card.classList.add('selected');
             
             routeLayers.clearLayers();
             const route = currentRoutes[index];
+            console.log('Route data:', route);
+            console.log('Number of legs:', route.legs?.length);
             
             // Visualize each leg with distinct colors
             route.legs.forEach((leg, legIndex) => {
+                console.log(`Processing leg ${legIndex}:`, leg.name, 'Type:', leg.type);
                 visualizeLeg(leg, legIndex);
             });
             
             // Add transit stops if bike-bus-bike route
             if (route.type === 'bike_bus_bike') {
+                console.log('Adding transit stops for bike-bus-bike route');
                 addTransitStopsToMap(route);
             }
             
             // Fit map to show the route
             try {
-                if (routeLayers.getLayers().length > 0) {
+                const layerCount = routeLayers.getLayers().length;
+                console.log('Total layers added:', layerCount);
+                
+                if (layerCount > 0) {
                     map.fitBounds(routeLayers.getBounds(), { padding: [20, 20] });
+                } else {
+                    console.warn('No layers were added to the map');
                 }
             } catch (e) {
                 console.warn('Could not fit bounds:', e);
