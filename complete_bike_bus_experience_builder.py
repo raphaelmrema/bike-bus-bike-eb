@@ -138,15 +138,56 @@ def get_transit_routes_google(origin: Tuple[float, float], destination: Tuple[fl
             "transit_routing_preference": "fewer_transfers",
             "key": GOOGLE_API_KEY,
         }
+        
+        logger.info(f"=== GOOGLE TRANSIT API REQUEST ===")
+        logger.info(f"URL: {GMAPS_DIRECTIONS_URL}")
+        logger.info(f"Origin: {origin[1]},{origin[0]} (lat,lng)")
+        logger.info(f"Destination: {destination[1]},{destination[0]} (lat,lng)")
+        logger.info(f"Departure time: {ts}")
+        
         r = requests.get(GMAPS_DIRECTIONS_URL, params=params, timeout=30)
         data = r.json()
+        
+        logger.info(f"=== GOOGLE API RESPONSE ===")
+        logger.info(f"Status: {data.get('status')}")
+        logger.info(f"Available routes: {len(data.get('routes', []))}")
+        
         if data.get("status") != "OK":
-            return {"error": data.get("error_message", f"Google Directions status: {data.get('status')}")}
+            error_msg = data.get("error_message", f"Google Directions status: {data.get('status')}")
+            logger.error(f"Google API Error: {error_msg}")
+            return {"error": error_msg}
+        
         routes = []
         for idx, rd in enumerate(data.get("routes", [])[:max_alternatives]):
+            logger.info(f"Processing route {idx + 1}...")
+            
+            # Log raw route data for debugging
+            legs = rd.get("legs", [])
+            if legs:
+                leg = legs[0]
+                logger.info(f"  Route {idx + 1} has {len(leg.get('steps', []))} steps")
+                logger.info(f"  Overview polyline: {bool(rd.get('overview_polyline', {}).get('points'))}")
+                
+                for step_idx, step in enumerate(leg.get('steps', [])):
+                    mode = step.get('travel_mode', 'UNKNOWN')
+                    has_polyline = bool(step.get('polyline', {}).get('points'))
+                    logger.info(f"    Step {step_idx + 1}: {mode}, has polyline: {has_polyline}")
+            
             parsed = parse_google_transit_route_enhanced(rd, idx)
-            if parsed: routes.append(parsed)
-        if not routes: return {"error": "No transit routes found"}
+            if parsed: 
+                logger.info(f"  Route {idx + 1} parsed successfully")
+                logger.info(f"  Geometry points: {len(parsed.get('route_geometry', []))}")
+                routes.append(parsed)
+            else:
+                logger.warning(f"  Route {idx + 1} failed to parse")
+        
+        if not routes: 
+            logger.warning("No routes parsed successfully")
+            return {"error": "No transit routes found"}
+        
+        logger.info(f"=== FINAL RESULT ===")
+        logger.info(f"Total parsed routes: {len(routes)}")
+        
         return {"routes": routes, "service": "Google Maps Transit + Real-time", "total_routes": len(routes)}
     except Exception as e:
         logger.error(f"Google Directions error: {e}")
