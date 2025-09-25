@@ -1,6 +1,6 @@
-# enhanced_osrm_google_transit.py
-# OSRM (bike) + Google Directions (transit) with Enhanced Real-Time Frontend
-# FastAPI app with GTFS integration and color-coded route visualization
+# enhanced_osrm_google_transit_with_geopandas.py
+# Complete FastAPI app with GeoPandas-based enhanced bike routing analysis
+# Optimized for Railway deployment with Git LFS support for large shapefiles
 
 import os
 import json
@@ -8,19 +8,54 @@ import logging
 import requests
 import datetime
 import math
+import sys
+import zipfile
+import numpy as np
 from typing import List, Dict, Optional, Tuple
-from fastapi import FastAPI, Query, HTTPException
+from fastapi import FastAPI, Query, HTTPException, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 import uvicorn
 
-# Ensure polyline is available
+# Auto-install required packages
+def _ensure_packages():
+    """Auto-install required packages if missing"""
+    reqs = ["geopandas", "shapely", "polyline", "rtree", "pyproj", "pandas", "numpy"]
+    missing = []
+    for r in reqs:
+        try:
+            if r == "rtree":
+                import rtree.index
+            elif r == "polyline":
+                import polyline
+            else:
+                __import__(r)
+        except ImportError:
+            missing.append(r)
+    
+    if missing:
+        print(f"Installing missing packages: {', '.join(missing)}")
+        import subprocess
+        for pkg in missing:
+            try:
+                subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
+                print(f"Successfully installed {pkg}")
+            except Exception as e:
+                print(f"Failed to install {pkg}: {e}")
+
+_ensure_packages()
+
 try:
+    import geopandas as gpd
+    import pandas as pd
+    from shapely.geometry import Point, LineString
+    from shapely.ops import nearest_points
     import polyline
-except ImportError:
-    import subprocess, sys
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "polyline"])
-    import polyline
+    GEOPANDAS_AVAILABLE = True
+    print("GeoPandas loaded successfully")
+except ImportError as e:
+    print(f"GeoPandas not available: {e}")
+    GEOPANDAS_AVAILABLE = False
 
 # =============================================================================
 # CONFIG
@@ -30,6 +65,12 @@ GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
 OSRM_SERVER = os.getenv("OSRM_SERVER", "http://router.project-osrm.org")
 USE_OSRM_DURATION = True
 BIKE_SPEED_MPH = float(os.getenv("BIKE_SPEED_MPH", "11"))
+
+# Shapefile paths - support both direct files and compressed archives
+ROADS_SHAPEFILE = os.getenv("ROADS_SHAPEFILE", "./data/roads.shp")
+ROADS_ARCHIVE = os.getenv("ROADS_ARCHIVE", "./data/roads.zip")
+TRANSIT_STOPS_SHAPEFILE = os.getenv("TRANSIT_STOPS_SHAPEFILE", "./data/transit_stops.shp")
+TRANSIT_STOPS_ARCHIVE = os.getenv("TRANSIT_STOPS_ARCHIVE", "./data/transit_stops.zip")
 
 GMAPS_DIRECTIONS_URL = "https://maps.googleapis.com/maps/api/directions/json"
 GMAPS_PLACES_NEARBY_URL = "https://maps.googleapis.com/maps/api/place/nearbysearch/json"
@@ -44,9 +85,9 @@ logger = logging.getLogger("enhanced-osrm-transit")
 # =============================================================================
 
 app = FastAPI(
-    title="Enhanced OSRM + Google Transit Planner",
-    description="Bike-Bus-Bike routing with enhanced real-time UI and color-coded routes",
-    version="2.0.0",
+    title="Enhanced OSRM + Google Transit + GeoPandas Planner",
+    description="Bike-Bus-Bike routing with advanced GeoPandas-based bicycle analysis",
+    version="3.1.0",
 )
 app.add_middleware(
     CORSMiddleware,
@@ -59,6 +100,21 @@ app.add_middleware(
 # =============================================================================
 # UTILITIES
 # =============================================================================
+
+def extract_if_archived(archive_path: str, extract_dir: str = "./data") -> bool:
+    """Extract compressed shapefile if archive exists"""
+    if os.path.exists(archive_path):
+        try:
+            logger.info(f"Extracting {archive_path}")
+            os.makedirs(extract_dir, exist_ok=True)
+            with zipfile.ZipFile(archive_path, 'r') as zip_ref:
+                zip_ref.extractall(extract_dir)
+            logger.info(f"Successfully extracted {archive_path}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to extract {archive_path}: {e}")
+            return False
+    return False
 
 def require_google_key():
     if not GOOGLE_API_KEY or len(GOOGLE_API_KEY.strip()) < 20:
@@ -81,11 +137,453 @@ def parse_epoch_to_hhmm(ts: Optional[int]) -> str:
     except Exception:
         return "Unknown"
 
+def _map_field(row_or_columns, candidates):
+    """Find field name from candidates (case-insensitive)"""
+    if hasattr(row_or_columns, 'keys'):
+        keys = list(row_or_columns.keys())
+    else:
+        keys = list(row_or_columns)
+    
+    lower_map = {str(k).lower(): k for k in keys}
+    
+    for cand in candidates:
+        lc = str(cand).lower()
+        if lc in lower_map:
+            return lower_map[lc]
+    return None
+
 # =============================================================================
-# OSRM BICYCLE ROUTING
+# LEVEL OF TRAFFIC STRESS (LTS) CLASSIFICATION
 # =============================================================================
 
-def calculate_bike_route_osrm(start_coords: List[float], end_coords: List[float], route_name="Bike Route"):
+def classify_lts(facility_type, speed_limit, lanes):
+    """Classify Level of Traffic Stress (LTS) from 1 (best) to 4 (worst)"""
+    ft = str(facility_type or "").upper().strip()
+    
+    try:
+        sp = float(speed_limit) if speed_limit is not None else 30
+    except (ValueError, TypeError):
+        sp = 30
+    
+    try:
+        ln = int(lanes) if lanes is not None else 2
+    except (ValueError, TypeError):
+        ln = 2
+
+    protected_facilities = {
+        "PROTECTED BIKELANE", "PROTECTED BIKE LANE", 
+        "SHARED USE PATH", "MIXED USE PATH", "BIKE PATH"
+    }
+    
+    buffered_facilities = {
+        "BUFFERED BIKELANE", "BUFFERED BIKE LANE", 
+        "UNBUFFERED BIKELANE", "UNBUFFERED BIKE LANE"
+    }
+    
+    shared_facilities = {
+        "SHARED LANE", "BIKE ROUTE"
+    }
+
+    if ft in protected_facilities:
+        return 1
+    elif ft in buffered_facilities and sp <= 30:
+        return 2
+    elif ft in shared_facilities and sp <= 35 and ln <= 2:
+        return 3
+    else:
+        return 4
+
+# =============================================================================
+# ENHANCED BIKE ROUTING CLASS
+# =============================================================================
+
+class EnhancedBikeRouter:
+    def __init__(self):
+        self.roads_gdf = None
+        self.roads_gdf_m = None
+        self.transit_stops_gdf = None
+        self.geopandas_enabled = GEOPANDAS_AVAILABLE
+
+    def load_shapefiles(self):
+        """Load shapefiles with support for compressed archives"""
+        if not self.geopandas_enabled:
+            logger.warning("GeoPandas not available - using basic OSRM routing only")
+            return
+
+        try:
+            # Handle roads shapefile/archive
+            roads_loaded = False
+            
+            # Try extracting archive first
+            if os.path.exists(ROADS_ARCHIVE):
+                extract_if_archived(ROADS_ARCHIVE)
+            
+            # Load roads shapefile
+            if os.path.exists(ROADS_SHAPEFILE):
+                logger.info(f"Loading roads from: {ROADS_SHAPEFILE}")
+                self.roads_gdf = gpd.read_file(ROADS_SHAPEFILE)
+                logger.info(f"Loaded roads: {len(self.roads_gdf)} features")
+                self._standardize_roads_columns()
+                self.roads_gdf_m = self._to_meters(self.roads_gdf)
+                roads_loaded = True
+            else:
+                logger.warning(f"Roads shapefile not found: {ROADS_SHAPEFILE}")
+
+            # Handle transit stops shapefile/archive  
+            if os.path.exists(TRANSIT_STOPS_ARCHIVE):
+                extract_if_archived(TRANSIT_STOPS_ARCHIVE)
+            
+            if os.path.exists(TRANSIT_STOPS_SHAPEFILE):
+                logger.info(f"Loading transit stops from: {TRANSIT_STOPS_SHAPEFILE}")
+                self.transit_stops_gdf = gpd.read_file(TRANSIT_STOPS_SHAPEFILE)
+                logger.info(f"Loaded transit stops: {len(self.transit_stops_gdf)} features")
+            else:
+                logger.warning(f"Transit stops shapefile not found: {TRANSIT_STOPS_SHAPEFILE}")
+
+            if roads_loaded:
+                logger.info("Enhanced bike routing with GeoPandas analysis enabled")
+            else:
+                logger.info("Using basic OSRM routing only")
+                
+        except Exception as e:
+            logger.error(f"Error loading shapefiles: {e}")
+            logger.info("Falling back to basic OSRM routing")
+
+    def _standardize_roads_columns(self):
+        """Standardize column names for consistent access"""
+        if self.roads_gdf is None:
+            return
+            
+        cols = self.roads_gdf.columns
+
+        total_score_f = _map_field(cols, [
+            "TOTAL_SCOR", "Total_Scor", "TOTAL_SCORE", "Total_Score", 
+            "Bike_Score", "bike_score", "BIKE_SCORE"
+        ])
+
+        fac_type_f = _map_field(cols, [
+            "FACILITY_T", "Facility_Type", "FACILITY_TYPE", "facility_type"
+        ])
+
+        speed_f = _map_field(cols, [
+            "SPEED", "Speed_Limit", "SPEED_LIMIT", "SPD_LIM"
+        ])
+
+        lanes_f = _map_field(cols, [
+            "Lane_Count", "Lanes", "LANES", "Num_Lanes", "NUM_LANES"
+        ])
+
+        try:
+            if total_score_f:
+                score_values = pd.to_numeric(self.roads_gdf[total_score_f], errors='coerce').fillna(0)
+                self.roads_gdf["Bike_Score__canon"] = score_values
+                self.roads_gdf["Directional_Score__canon"] = 100
+            else:
+                self.roads_gdf["Bike_Score__canon"] = 0
+                self.roads_gdf["Directional_Score__canon"] = 100
+        except:
+            self.roads_gdf["Bike_Score__canon"] = 0
+            self.roads_gdf["Directional_Score__canon"] = 100
+
+        self.roads_gdf["Facility_Type__canon"] = (
+            self.roads_gdf[fac_type_f].fillna("NO BIKELANE") 
+            if fac_type_f else "NO BIKELANE"
+        )
+
+        try:
+            self.roads_gdf["Speed_Limit__canon"] = (
+                pd.to_numeric(self.roads_gdf[speed_f], errors='coerce').fillna(30)
+                if speed_f else 30
+            )
+        except:
+            self.roads_gdf["Speed_Limit__canon"] = 30
+
+        try:
+            self.roads_gdf["Lanes__canon"] = (
+                pd.to_numeric(self.roads_gdf[lanes_f], errors='coerce').fillna(2)
+                if lanes_f else 2
+            )
+        except:
+            self.roads_gdf["Lanes__canon"] = 2
+
+        logger.info("Standardized road attribute columns")
+
+    def _to_meters(self, gdf):
+        """Return a projected (meters) copy for accurate calculations"""
+        if gdf is None or gdf.empty:
+            return gdf
+            
+        if gdf.crs is None:
+            gdf = gdf.set_crs("EPSG:4326", allow_override=True)
+        
+        try:
+            target_crs = gdf.estimate_utm_crs()
+        except Exception:
+            target_crs = "EPSG:3857"
+            
+        try:
+            return gdf.to_crs(target_crs)
+        except Exception:
+            return gdf
+
+    def _sample_line_points(self, line, num_points=5):
+        """Sample points along a line at regular intervals."""
+        try:
+            if line.is_empty or line.length == 0:
+                return []
+                
+            points = []
+            for i in range(num_points):
+                distance = (i / (num_points - 1)) * line.length if num_points > 1 else 0
+                point = line.interpolate(distance)
+                points.append((point.x, point.y))
+            return points
+        except Exception:
+            return []
+
+    def _calculate_average_bearing(self, points):
+        """Calculate average bearing (direction) from a series of points."""
+        try:
+            if len(points) < 2:
+                return 0
+                
+            bearings = []
+            for i in range(len(points) - 1):
+                x1, y1 = points[i]
+                x2, y2 = points[i + 1]
+                
+                dx = x2 - x1
+                dy = y2 - y1
+                
+                if dx == 0 and dy == 0:
+                    continue
+                    
+                bearing = math.atan2(dy, dx) * 180 / math.pi
+                bearing = (bearing + 360) % 360
+                bearings.append(bearing)
+            
+            if not bearings:
+                return 0
+                
+            sin_sum = sum(math.sin(math.radians(b)) for b in bearings)
+            cos_sum = sum(math.cos(math.radians(b)) for b in bearings)
+            
+            mean_bearing = math.atan2(sin_sum, cos_sum) * 180 / math.pi
+            return (mean_bearing + 360) % 360
+            
+        except Exception:
+            return 0
+
+    def _calculate_alignment_score(self, route_line, road_line):
+        """Calculate how well the road segment aligns with the route direction."""
+        try:
+            route_points = self._sample_line_points(route_line, num_points=5)
+            road_points = self._sample_line_points(road_line, num_points=5)
+            
+            if len(route_points) < 2 or len(road_points) < 2:
+                return 0.5
+            
+            route_bearing = self._calculate_average_bearing(route_points)
+            road_bearing = self._calculate_average_bearing(road_points)
+            
+            angle_diff = abs(route_bearing - road_bearing)
+            angle_diff = min(angle_diff, 360 - angle_diff)
+            angle_diff = min(angle_diff, 180 - angle_diff)
+            
+            alignment_score = 1 - (angle_diff / 90.0)
+            return max(0, min(1, alignment_score))
+            
+        except Exception:
+            return 0.5
+
+    def _calculate_proximity_score(self, route_line, road_line):
+        """Calculate proximity score based on distance."""
+        try:
+            distance = route_line.distance(road_line)
+            
+            if distance <= 1:
+                return 1.0
+            elif distance <= 10:
+                return 0.8 + 0.2 * (10 - distance) / 9
+            elif distance <= 25:
+                return 0.3 + 0.5 * (25 - distance) / 15
+            else:
+                return max(0, 0.3 * math.exp(-(distance - 25) / 25))
+                
+        except Exception:
+            return 0.1
+
+    def _calculate_coverage_score(self, route_line, road_line):
+        """Calculate how much of the route length is covered."""
+        try:
+            road_buffer = road_line.buffer(15)
+            intersection = route_line.intersection(road_buffer)
+            
+            if intersection.is_empty:
+                return 0
+                
+            coverage_length = intersection.length if hasattr(intersection, 'length') else 0
+            route_length = route_line.length
+            
+            coverage_ratio = coverage_length / route_length if route_length > 0 else 0
+            return min(1.0, coverage_ratio)
+            
+        except Exception:
+            return 0.1
+
+    def analyze_route_segments(self, route_geometry):
+        """Enhanced route segment analysis using alignment-based selection"""
+        if not self.geopandas_enabled or self.roads_gdf is None:
+            # Return basic default analysis
+            return [], 50.0, {"BASIC OSRM": {"length_miles": 0.0, "percentage": 100.0, "avg_score": 50.0}}
+
+        try:
+            if not route_geometry or not route_geometry.get("coordinates"):
+                return [], 50.0, {"NO DATA": {"length_miles": 0.0, "percentage": 100.0, "avg_score": 0.0}}
+
+            coords = route_geometry["coordinates"]
+            if len(coords) < 2:
+                return [], 50.0, {"NO DATA": {"length_miles": 0.0, "percentage": 100.0, "avg_score": 0.0}}
+                
+            route_ll = LineString([(float(lon), float(lat)) for lon, lat in coords])
+            route_gdf = gpd.GeoDataFrame({"id": [1]}, geometry=[route_ll], crs="EPSG:4326")
+
+            if self.roads_gdf is None or self.roads_gdf.empty:
+                route_length_miles = route_ll.length * 69.0
+                return [], 50.0, {"NO SHAPEFILE DATA": {"length_miles": route_length_miles, "percentage": 100.0, "avg_score": 50.0}}
+
+            route_m = self._to_meters(route_gdf)
+            roads_m = self.roads_gdf_m
+
+            if route_m is None or roads_m is None:
+                route_length_miles = route_ll.length * 69.0
+                return [], 50.0, {"PROJECTION ERROR": {"length_miles": route_length_miles, "percentage": 100.0, "avg_score": 50.0}}
+
+            route_line_m = route_m.geometry.iloc[0]
+            
+            initial_buffer = 50
+            route_buffered = route_line_m.buffer(initial_buffer)
+            candidate_mask = roads_m.geometry.intersects(route_buffered)
+            candidates = roads_m[candidate_mask].copy()
+
+            if candidates.empty:
+                route_length_miles = route_ll.length * 69.0
+                return [], 50.0, {"NO CANDIDATES": {"length_miles": route_length_miles, "percentage": 100.0, "avg_score": 50.0}}
+
+            selected_segments = []
+            
+            for idx, road_row in candidates.iterrows():
+                road_geom = road_row.geometry
+                if road_geom is None or road_geom.is_empty:
+                    continue
+                    
+                alignment_score = self._calculate_alignment_score(route_line_m, road_geom)
+                proximity_score = self._calculate_proximity_score(route_line_m, road_geom)
+                coverage_score = self._calculate_coverage_score(route_line_m, road_geom)
+                
+                overall_match_score = (
+                    alignment_score * 0.4 +
+                    proximity_score * 0.4 +
+                    coverage_score * 0.2
+                )
+                
+                if overall_match_score >= 0.3:
+                    bike_score = float(road_row.get("Bike_Score__canon", 0))
+                    dir_score = float(road_row.get("Directional_Score__canon", 100))
+                    facility_type = str(road_row.get("Facility_Type__canon", "NO BIKELANE"))
+                    speed_limit = float(road_row.get("Speed_Limit__canon", 30))
+                    lanes = int(road_row.get("Lanes__canon", 2))
+
+                    composite_score = (bike_score * dir_score) / 100.0
+                    lts = classify_lts(facility_type, speed_limit, lanes)
+                    
+                    try:
+                        seg_length_m = float(road_geom.length) * proximity_score
+                    except:
+                        seg_length_m = 100.0
+
+                    if seg_length_m > 0:
+                        selected_segments.append({
+                            "facility_type": facility_type,
+                            "bike_score": round(bike_score, 1),
+                            "directional_score": round(dir_score, 1),
+                            "composite_score": round(composite_score, 2),
+                            "LTS": lts,
+                            "length_ft": round(seg_length_m * 3.28084, 1),
+                            "length_m": seg_length_m,
+                            "speed_limit": speed_limit,
+                            "lanes": lanes,
+                            "match_quality": round(overall_match_score, 3)
+                        })
+
+            if not selected_segments:
+                route_length_miles = route_ll.length * 69.0
+                return [], 50.0, {"NO MATCHES": {"length_miles": route_length_miles, "percentage": 100.0, "avg_score": 50.0}}
+
+            total_length_m = sum(seg["length_m"] for seg in selected_segments)
+            weighted_score_sum = sum(seg["composite_score"] * seg["length_m"] for seg in selected_segments)
+            overall_score = weighted_score_sum / total_length_m if total_length_m > 0 else 50.0
+
+            facility_buckets = {}
+            for seg in selected_segments:
+                facility_type = seg["facility_type"]
+                length_m = seg["length_m"]
+                
+                if facility_type not in facility_buckets:
+                    facility_buckets[facility_type] = {"length_m": 0.0, "count": 0, "score_sum": 0.0}
+                
+                facility_buckets[facility_type]["length_m"] += length_m
+                facility_buckets[facility_type]["count"] += 1
+                facility_buckets[facility_type]["score_sum"] += seg["composite_score"]
+
+            facility_stats = {}
+            for facility_type, stats in facility_buckets.items():
+                length_miles = stats["length_m"] * 0.000621371
+                percentage = (stats["length_m"] / total_length_m) * 100.0 if total_length_m > 0 else 0.0
+                avg_score = stats["score_sum"] / stats["count"] if stats["count"] > 0 else 0.0
+                
+                facility_stats[facility_type] = {
+                    "length_miles": round(length_miles, 3),
+                    "percentage": round(percentage, 1),
+                    "count": stats["count"],
+                    "avg_score": round(avg_score, 1)
+                }
+            
+            return selected_segments, round(overall_score, 1), facility_stats
+
+        except Exception as e:
+            logger.error(f"Analysis error: {e}")
+            return [], 50.0, {"ANALYSIS ERROR": {"length_miles": 0.0, "percentage": 100.0, "avg_score": 0.0}}
+
+# Create global router instance
+enhanced_router = EnhancedBikeRouter()
+
+# =============================================================================
+# STARTUP EVENT - Extract archives and load shapefiles
+# =============================================================================
+
+@app.on_event("startup")
+async def startup_event():
+    """Extract archives and load shapefiles on startup"""
+    logger.info("Starting up enhanced bike-bus-bike routing service...")
+    
+    # Extract any compressed archives
+    if os.path.exists(ROADS_ARCHIVE):
+        extract_if_archived(ROADS_ARCHIVE)
+    if os.path.exists(TRANSIT_STOPS_ARCHIVE):
+        extract_if_archived(TRANSIT_STOPS_ARCHIVE)
+    
+    # Load shapefiles
+    enhanced_router.load_shapefiles()
+    
+    logger.info("Startup complete")
+
+# =============================================================================
+# ENHANCED BIKE ROUTING FUNCTIONS
+# =============================================================================
+
+def calculate_bike_route_enhanced(start_coords: List[float], end_coords: List[float], route_name="Enhanced Bike Route"):
+    """Create enhanced bike route using OSRM + GeoPandas analysis"""
     try:
         coords = f"{start_coords[0]},{start_coords[1]};{end_coords[0]},{end_coords[1]}"
         url = f"{OSRM_SERVER}/route/v1/cycling/{coords}"
@@ -93,7 +591,9 @@ def calculate_bike_route_osrm(start_coords: List[float], end_coords: List[float]
         r = requests.get(url, params=params, timeout=30)
         r.raise_for_status()
         data = r.json()
-        if data.get("code") != "Ok" or not data.get("routes"): return None
+        
+        if data.get("code") != "Ok" or not data.get("routes"): 
+            return None
 
         route = data["routes"][0]
         distance_m = float(route.get("distance", 0.0))
@@ -105,23 +605,32 @@ def calculate_bike_route_osrm(start_coords: List[float], end_coords: List[float]
             duration_min = (distance_mi / BIKE_SPEED_MPH) * 60.0
 
         coords_lonlat = decode_polyline_to_lonlat(route["geometry"])
-        score = max(0, min(100, 70 + (10 if distance_mi < 2 else -5)))
-
-        return {
+        
+        route_data = {
             "name": route_name,
             "length_miles": round(distance_mi, 3),
             "travel_time_minutes": round(duration_min, 1),
             "travel_time_formatted": format_time_duration(duration_min),
             "geometry": {"type": "LineString", "coordinates": coords_lonlat},
-            "overall_score": score,
             "route_type": "bike"
         }
+        
+        # Enhanced analysis using GeoPandas (if available)
+        segments, overall_score, facility_stats = enhanced_router.analyze_route_segments(route_data["geometry"])
+        
+        route_data.update({
+            "segments": segments,
+            "overall_score": overall_score,
+            "facility_stats": facility_stats
+        })
+
+        return route_data
     except Exception as e:
-        logger.error(f"OSRM error: {e}")
+        logger.error(f"Enhanced bike route error: {e}")
         return None
 
 # =============================================================================
-# GOOGLE TRANSIT
+# GOOGLE TRANSIT FUNCTIONS (unchanged from your original)
 # =============================================================================
 
 def get_transit_routes_google(origin: Tuple[float, float], destination: Tuple[float, float], departure_time: str = "now", max_alternatives: int = 3) -> Dict:
@@ -139,54 +648,21 @@ def get_transit_routes_google(origin: Tuple[float, float], destination: Tuple[fl
             "key": GOOGLE_API_KEY,
         }
         
-        logger.info(f"=== GOOGLE TRANSIT API REQUEST ===")
-        logger.info(f"URL: {GMAPS_DIRECTIONS_URL}")
-        logger.info(f"Origin: {origin[1]},{origin[0]} (lat,lng)")
-        logger.info(f"Destination: {destination[1]},{destination[0]} (lat,lng)")
-        logger.info(f"Departure time: {ts}")
-        
         r = requests.get(GMAPS_DIRECTIONS_URL, params=params, timeout=30)
         data = r.json()
         
-        logger.info(f"=== GOOGLE API RESPONSE ===")
-        logger.info(f"Status: {data.get('status')}")
-        logger.info(f"Available routes: {len(data.get('routes', []))}")
-        
         if data.get("status") != "OK":
             error_msg = data.get("error_message", f"Google Directions status: {data.get('status')}")
-            logger.error(f"Google API Error: {error_msg}")
             return {"error": error_msg}
         
         routes = []
         for idx, rd in enumerate(data.get("routes", [])[:max_alternatives]):
-            logger.info(f"Processing route {idx + 1}...")
-            
-            # Log raw route data for debugging
-            legs = rd.get("legs", [])
-            if legs:
-                leg = legs[0]
-                logger.info(f"  Route {idx + 1} has {len(leg.get('steps', []))} steps")
-                logger.info(f"  Overview polyline: {bool(rd.get('overview_polyline', {}).get('points'))}")
-                
-                for step_idx, step in enumerate(leg.get('steps', [])):
-                    mode = step.get('travel_mode', 'UNKNOWN')
-                    has_polyline = bool(step.get('polyline', {}).get('points'))
-                    logger.info(f"    Step {step_idx + 1}: {mode}, has polyline: {has_polyline}")
-            
             parsed = parse_google_transit_route_enhanced(rd, idx)
             if parsed: 
-                logger.info(f"  Route {idx + 1} parsed successfully")
-                logger.info(f"  Geometry points: {len(parsed.get('route_geometry', []))}")
                 routes.append(parsed)
-            else:
-                logger.warning(f"  Route {idx + 1} failed to parse")
         
         if not routes: 
-            logger.warning("No routes parsed successfully")
             return {"error": "No transit routes found"}
-        
-        logger.info(f"=== FINAL RESULT ===")
-        logger.info(f"Total parsed routes: {len(routes)}")
         
         return {"routes": routes, "service": "Google Maps Transit + Real-time", "total_routes": len(routes)}
     except Exception as e:
@@ -211,7 +687,6 @@ def parse_google_transit_route_enhanced(route_data: Dict, route_index: int) -> O
         route_geometry: List[List[float]] = []
         transit_boardings = 0
 
-        # Enhanced step parsing with real-time simulation
         for i, s in enumerate(steps_raw):
             ps = parse_transit_step_enhanced(s, i)
             if ps:
@@ -223,7 +698,6 @@ def parse_google_transit_route_enhanced(route_data: Dict, route_index: int) -> O
 
         transfers = max(0, transit_boardings - 1)
         
-        # Add real-time enhancement
         enhanced_route = {
             "route_number": route_index + 1,
             "name": f"Transit Route {route_index + 1}" + (f" ({transfers} transfers)" if transfers else ""),
@@ -238,688 +712,4 @@ def parse_google_transit_route_enhanced(route_data: Dict, route_index: int) -> O
             "service": "Google Maps Transit",
             "route_type": "transit",
             "realtime_enhanced": True,
-            "enhancement_timestamp": datetime.datetime.now().isoformat()
-        }
-        
-        return enhanced_route
-    except Exception as e:
-        logger.error(f"Parse Google route error: {e}")
-        return None
-
-def parse_transit_step_enhanced(step: Dict, index: int) -> Optional[Dict]:
-    try:
-        mode = step.get("travel_mode", "UNKNOWN").upper()
-        dur_s = step.get("duration", {}).get("value", 0)
-        dist_m = step.get("distance", {}).get("value", 0)
-        
-        base = {
-            "step_number": index + 1,
-            "travel_mode": mode,
-            "duration_minutes": round(dur_s / 60.0, 1),
-            "duration_text": format_time_duration(dur_s / 60.0),
-            "distance_miles": round(dist_m * 0.000621371, 2),
-            "distance_meters": dist_m,
-            "distance_km": round(dist_m / 1000, 2),
-            "instruction": step.get("html_instructions", "").replace('<[^>]*>', ''),
-        }
-        
-        if mode == "TRANSIT":
-            td = step.get("transit_details", {}) or {}
-            dep = td.get("departure_stop", {}) or {}
-            arr = td.get("arrival_stop", {}) or {}
-            line = td.get("line", {}) or {}
-            
-            base.update({
-                "transit_line": line.get("short_name") or line.get("name") or "Transit",
-                "transit_line_color": line.get("color", "#1f8dd6"),
-                "departure_stop_name": dep.get("name", "Stop"),
-                "departure_stop_location": dep.get("location", {}),
-                "arrival_stop_name": arr.get("name", "Stop"),
-                "arrival_stop_location": arr.get("location", {}),
-                "headsign": td.get("headsign", ""),
-                "num_stops": td.get("num_stops", 0),
-                "scheduled_departure": td.get("departure_time", {}).get("text", ""),
-                "scheduled_arrival": td.get("arrival_time", {}).get("text", ""),
-                # Simulated real-time data
-                "enhanced_gtfs_data": simulate_realtime_departures(dep.get("name", "Stop"))
-            })
-        return base
-    except Exception as e:
-        logger.error(f"Parse step error: {e}")
-        return None
-
-def simulate_realtime_departures(stop_name: str) -> Dict:
-    """Simulate real-time departure data"""
-    import random
-    current_time = datetime.datetime.now()
-    departures = []
-    
-    # Generate 5-8 upcoming departures
-    for i in range(random.randint(5, 8)):
-        base_time = current_time + datetime.timedelta(minutes=random.randint(2, 45))
-        delay_minutes = random.randint(0, 8) if random.random() < 0.4 else 0
-        actual_time = base_time + datetime.timedelta(minutes=delay_minutes)
-        
-        departure = {
-            "departure_time": base_time.strftime("%H:%M:%S"),
-            "realtime_departure": actual_time.strftime("%H:%M"),
-            "delay_minutes": delay_minutes,
-            "status_text": "On time" if delay_minutes == 0 else f"Delayed {delay_minutes} min",
-            "status_color": "#4caf50" if delay_minutes == 0 else ("#ff9800" if delay_minutes < 5 else "#f44336"),
-            "route_name": f"Route {random.randint(1, 50)}",
-            "time_until_departure": format_time_until(actual_time - current_time)
-        }
-        departures.append(departure)
-    
-    return {
-        "stop_name": stop_name,
-        "realtime_departures": sorted(departures, key=lambda x: x["realtime_departure"]),
-        "total_departures": len(departures),
-        "has_delays": any(d["delay_minutes"] > 0 for d in departures),
-        "last_updated": current_time.strftime("%H:%M:%S"),
-        "realtime_enabled": True
-    }
-
-def format_time_until(time_diff: datetime.timedelta) -> str:
-    total_minutes = int(time_diff.total_seconds() / 60)
-    if total_minutes < 1: return "Due now"
-    elif total_minutes < 60: return f"{total_minutes} min"
-    else:
-        hours = total_minutes // 60
-        minutes = total_minutes % 60
-        return f"{hours}h" if minutes == 0 else f"{hours}h {minutes}m"
-
-def find_nearby_transit_stations_google(point_coords: List[float], radius_meters: int = 800, max_results: int = 6):
-    require_google_key()
-    try:
-        params = {
-            "location": f"{point_coords[1]},{point_coords[0]}",
-            "radius": radius_meters,
-            "type": "transit_station",
-            "key": GOOGLE_API_KEY,
-        }
-        r = requests.get(GMAPS_PLACES_NEARBY_URL, params=params, timeout=15)
-        data = r.json()
-        status = data.get("status", "UNKNOWN")
-        if status not in ("OK", "ZERO_RESULTS"):
-            logger.warning(f"Places nearby status: {status}")
-            return []
-        results = data.get("results", [])[:max_results]
-        out = []
-        for item in results:
-            loc = (item.get("geometry", {}) or {}).get("location", {})
-            out.append({
-                "id": item.get("place_id", ""),
-                "name": item.get("name", "Transit Station"),
-                "x": loc.get("lng"), "y": loc.get("lat"),
-                "display_x": loc.get("lng"), "display_y": loc.get("lat"),
-            })
-        return out
-    except Exception as e:
-        logger.error(f"Places Nearby error: {e}")
-        return []
-
-# =============================================================================
-# BIKE-BUS-BIKE ANALYSIS
-# =============================================================================
-
-def analyze_complete_bike_bus_bike_routes(start_point: List[float], end_point: List[float], departure_time="now"):
-    routes = []
-    
-    start_stops = find_nearby_transit_stations_google(start_point, radius_meters=800, max_results=4)
-    end_stops = find_nearby_transit_stations_google(end_point, radius_meters=800, max_results=4)
-    
-    # Bike-Bus-Bike combinations
-    if start_stops and end_stops:
-        s = start_stops[0]; e = end_stops[0]
-        if s["id"] == e["id"] and len(end_stops) > 1: e = end_stops[1]
-        
-        if s["id"] != e["id"]:
-            bike1 = calculate_bike_route_osrm(start_point, [s["display_x"], s["display_y"]], "Start to Station")
-            bike2 = calculate_bike_route_osrm([e["display_x"], e["display_y"]], end_point, "Station to Destination")
-            
-            if bike1 and bike2:
-                tr = get_transit_routes_google((s["display_x"], s["display_y"]), (e["display_x"], e["display_y"]), departure_time)
-                if tr.get("routes"):
-                    for i, r in enumerate(tr["routes"]):
-                        total_bike_mi = bike1["length_miles"] + bike2["length_miles"]
-                        total_transit_mi = r["distance_miles"]
-                        total_mi = total_bike_mi + total_transit_mi
-                        total_time = bike1["travel_time_minutes"] + r["duration_minutes"] + bike2["travel_time_minutes"] + 5.0
-                        
-                        bike_score = 0.0
-                        if total_bike_mi > 0:
-                            bike_score = (bike1["overall_score"]*bike1["length_miles"] + bike2["overall_score"]*bike2["length_miles"]) / total_bike_mi
-                        
-                        r_enh = dict(r); r_enh["start_stop"] = s; r_enh["end_stop"] = e
-                        
-                        routes.append({
-                            "id": len(routes)+1,
-                            "name": f"Bike-Bus-Bike Option {i+1}",
-                            "type": "bike_bus_bike",
-                            "summary": {
-                                "total_time_minutes": round(total_time, 1),
-                                "total_time_formatted": format_time_duration(total_time),
-                                "total_distance_miles": round(total_mi, 2),
-                                "bike_distance_miles": round(total_bike_mi, 2),
-                                "transit_distance_miles": round(total_transit_mi, 2),
-                                "bike_percentage": round((total_bike_mi/total_mi)*100, 1) if total_mi>0 else 0.0,
-                                "average_bike_score": round(bike_score, 1),
-                                "transfers": r.get("transfers", 0),
-                                "departure_time": r.get("departure_time", "Unknown"),
-                                "arrival_time": r.get("arrival_time", "Unknown"),
-                            },
-                            "legs": [
-                                {"type":"bike","name":"Bike to Station","description":f"Bike to {s['name']}","route":bike1,"color":"#27ae60","order":1},
-                                {"type":"transit","name":"Transit Route","description":f"Transit {s['name']} → {e['name']}","route":r_enh,"color":"#3498db","order":2},
-                                {"type":"bike","name":"Station to Destination","description":f"Bike from {e['name']}","route":bike2,"color":"#27ae60","order":3},
-                            ]
-                        })
-    
-    # Direct bike route
-    direct_bike = calculate_bike_route_osrm(start_point, end_point, "Direct Bike Route")
-    if direct_bike:
-        routes.append({
-            "id": len(routes)+1,
-            "name": "Direct Bike Route",
-            "type": "direct_bike",
-            "summary": {
-                "total_time_minutes": direct_bike["travel_time_minutes"],
-                "total_time_formatted": direct_bike["travel_time_formatted"],
-                "total_distance_miles": direct_bike["length_miles"],
-                "bike_distance_miles": direct_bike["length_miles"],
-                "transit_distance_miles": 0.0,
-                "bike_percentage": 100.0,
-                "average_bike_score": direct_bike["overall_score"],
-                "transfers": 0,
-                "departure_time": "Immediate",
-                "arrival_time": "Flexible",
-            },
-            "legs": [{"type":"bike","name":"Direct Bike Route","description":"Complete bike route","route":direct_bike,"color":"#e74c3c","order":1}]
-        })
-    
-    if not routes:
-        raise HTTPException(status_code=400, detail="No routes found")
-    
-    routes.sort(key=lambda x: x["summary"]["total_time_minutes"])
-    
-    return {
-        "success": True,
-        "analysis_type": "enhanced_bike_bus_bike",
-        "routing_engine": "OSRM + Google Transit + Real-time",
-        "routes": routes,
-        "bus_stops": {"start_stops": start_stops, "end_stops": end_stops},
-        "statistics": {
-            "total_options": len(routes),
-            "fastest_option": routes[0]["name"],
-            "fastest_time": routes[0]["summary"]["total_time_formatted"],
-        },
-        "bike_speed_mph": BIKE_SPEED_MPH,
-        "analysis_timestamp": datetime.datetime.now().isoformat(),
-        "realtime_enabled": True
-    }
-
-# =============================================================================
-# ENDPOINTS
-# =============================================================================
-
-@app.get("/", response_class=HTMLResponse)
-async def enhanced_ui():
-    return """<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Enhanced Bike-Bus-Bike Planner</title>
-    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
-    <style>
-        body { margin: 0; padding: 0; font-family: 'Segoe UI', sans-serif; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height: 100vh; }
-        .header { background: linear-gradient(135deg, #4285f4, #34a853); color: white; padding: 20px; text-align: center; box-shadow: 0 2px 10px rgba(0,0,0,0.2); }
-        .header h1 { margin: 0; font-size: 2.2em; font-weight: 300; display: flex; align-items: center; justify-content: center; gap: 10px; }
-        .header p { margin: 10px 0 0 0; opacity: 0.9; font-size: 1.1em; }
-        .realtime-badge { font-weight: bold; background: linear-gradient(45deg, #ff6b6b, #4ecdc4); color: white; padding: 4px 8px; border-radius: 4px; font-size: 0.8em; animation: pulse 2s infinite; }
-        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.7; } }
-        .container { display: flex; height: calc(100vh - 120px); max-width: 1400px; margin: 0 auto; background: white; border-radius: 10px 10px 0 0; overflow: hidden; box-shadow: 0 -5px 20px rgba(0,0,0,0.1); }
-        #map { flex: 2; height: 100%; }
-        #sidebar { flex: 1; padding: 25px; overflow-y: auto; max-width: 450px; background: #f8f9fa; border-left: 1px solid #dee2e6; }
-        .system-status { background: linear-gradient(135deg, #d4edda, #c3e6cb); color: #155724; padding: 12px; border-radius: 8px; margin-bottom: 20px; text-align: center; font-weight: 500; border-left: 4px solid #28a745; }
-        .instructions { background: linear-gradient(135deg, #fff3cd, #ffeaa7); color: #856404; padding: 15px; border-radius: 8px; margin-bottom: 20px; text-align: center; border-left: 4px solid #f1c40f; }
-        .form-group { margin-bottom: 20px; }
-        label { display: block; margin-bottom: 8px; font-weight: 600; color: #333; font-size: 1em; }
-        input, select { width: 100%; padding: 12px 15px; border: 2px solid #e1e5e9; border-radius: 8px; font-size: 1em; transition: all 0.3s ease; background: white; box-sizing: border-box; }
-        input:focus, select:focus { outline: none; border-color: #4285f4; box-shadow: 0 0 0 3px rgba(66, 133, 244, 0.1); }
-        button { background: linear-gradient(135deg, #4285f4, #34a853); color: white; padding: 15px 25px; border: none; border-radius: 8px; cursor: pointer; font-size: 1.1em; font-weight: 600; width: 100%; margin-bottom: 15px; transition: all 0.3s ease; }
-        button:hover { transform: translateY(-2px); box-shadow: 0 8px 20px rgba(66, 133, 244, 0.3); }
-        button:disabled { background: #ccc; cursor: not-allowed; transform: none; box-shadow: none; }
-        .clear-btn { background: linear-gradient(135deg, #ea4335, #fbbc04); }
-        .route-card { background: white; border: 2px solid #e9ecef; border-radius: 12px; padding: 20px; margin-bottom: 20px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); cursor: pointer; transition: all 0.3s ease; }
-        .route-card:hover { transform: translateY(-3px); box-shadow: 0 8px 25px rgba(0,0,0,0.15); border-color: #4285f4; }
-        .route-card.selected { border-color: #4285f4; background: linear-gradient(135deg, #f8f9ff, #fff); box-shadow: 0 0 0 3px rgba(66, 133, 244, 0.1); }
-        .route-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; }
-        .route-name { font-weight: 700; color: #333; font-size: 1.2em; }
-        .realtime-badge-small { background: linear-gradient(135deg, #ff6b6b, #4ecdc4); color: white; padding: 4px 8px; border-radius: 15px; font-size: 10px; font-weight: 600; animation: pulse 2s infinite; }
-        .enhanced-schedules { background: linear-gradient(135deg, #e3f2fd, #bbdefb); padding: 12px; border-radius: 8px; margin-top: 10px; border-left: 4px solid #2196f3; }
-        .enhanced-schedules h4 { margin: 0 0 8px 0; color: #1565c0; font-size: 14px; }
-        .realtime-departures { display: flex; flex-direction: column; gap: 4px; }
-        .departure-item { display: flex; justify-content: space-between; align-items: center; padding: 4px 8px; border-radius: 6px; background: rgba(255,255,255,0.7); }
-        .departure-time-realtime { font-weight: 600; color: #1565c0; }
-        .departure-status { font-size: 10px; padding: 2px 6px; border-radius: 10px; color: white; }
-        .status-ontime { background: #4caf50; }
-        .status-delayed { background: #ff9800; }
-        .status-late { background: #f44336; }
-        .route-metrics { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; margin-bottom: 15px; }
-        .metric { text-align: center; padding: 10px; background: white; border: 1px solid #e9ecef; border-radius: 8px; }
-        .metric-value { font-weight: bold; color: #4285f4; font-size: 16px; }
-        .metric-label { font-size: 11px; color: #666; text-transform: uppercase; margin-top: 2px; }
-        .error { background: linear-gradient(135deg, #ffebee, #ffcdd2); color: #c62828; padding: 15px; border-radius: 8px; margin: 15px 0; border-left: 4px solid #f44336; }
-        .spinner { border: 3px solid #f3f3f3; border-top: 3px solid #4285f4; border-radius: 50%; width: 35px; height: 35px; animation: spin 1s linear infinite; margin: 25px auto; display: none; }
-        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
-        .coords { font-size: 12px; color: #555; background: #eef1f4; padding: 8px; border-radius: 4px; margin-top: 8px; }
-    </style>
-</head>
-<body>
-    <div class="header">
-        <h1>🚴‍♂️🚌 Enhanced Bike-Bus-Bike Planner <span class="realtime-badge">REAL-TIME</span></h1>
-        <p>OSRM bicycle routing + Google Transit with live departures & color-coded routes</p>
-    </div>
-    
-    <div class="container">
-        <div id="map"></div>
-        <div id="sidebar">
-            <div class="system-status">
-                🟢 Enhanced System: OSRM + Google Maps + Real-time GTFS
-            </div>
-            
-            <div class="instructions">
-                <strong>📍 How to Use:</strong><br>
-                1. Click map for origin (green)<br>
-                2. Click again for destination (red)<br>
-                3. Get color-coded bike+transit routes!<br>
-                🚴‍♂️ Green = Bike routes<br>
-                🚌 Blue = Transit routes
-            </div>
-            
-            <div class="form-group">
-                <label>🕐 Departure Time</label>
-                <select id="departureTime">
-                    <option value="now">Leave Now</option>
-                    <option value="custom">Custom</option>
-                </select>
-                <div id="customTimeGroup" style="display:none; margin-top:10px;">
-                    <input type="datetime-local" id="customTime">
-                </div>
-            </div>
-            
-            <button id="findRoutesBtn" disabled>🔍 Find Enhanced Routes</button>
-            <button class="clear-btn" id="clearBtn">🗑️ Clear All</button>
-            
-            <div class="coords">
-                <div><b>Start:</b> <span id="startCoords">Click map</span></div>
-                <div><b>End:</b> <span id="endCoords">Click map</span></div>
-            </div>
-            
-            <div class="spinner" id="spinner"></div>
-            <div id="results"></div>
-        </div>
-    </div>
-
-    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-    <script>
-        let map = L.map('map').setView([30.3322, -81.6557], 12);
-        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {attribution: '© OpenStreetMap'}).addTo(map);
-        
-        let start = null, endp = null, startMarker = null, endMarker = null;
-        let routeLayers = L.layerGroup().addTo(map);
-        let currentRoutes = [];
-        
-        // Color scheme for different route types
-        const routeColors = {
-            bike: '#27ae60',      // Green for bike routes
-            transit: '#3498db',   // Blue for transit routes
-            direct_bike: '#e74c3c' // Red for direct bike routes
-        };
-        
-        // Event handlers
-        document.getElementById('departureTime').addEventListener('change', function() {
-            const customGroup = document.getElementById('customTimeGroup');
-            if (this.value === 'custom') {
-                customGroup.style.display = 'block';
-                const now = new Date();
-                now.setMinutes(now.getMinutes() - now.getTimezoneOffset());
-                document.getElementById('customTime').value = now.toISOString().slice(0, 16);
-            } else {
-                customGroup.style.display = 'none';
-            }
-        });
-        
-        map.on('click', function(e) {
-            const lat = e.latlng.lat, lng = e.latlng.lng;
-            
-            if (!start) {
-                if (startMarker) map.removeLayer(startMarker);
-                start = [lng, lat];
-                startMarker = L.marker([lat, lng], {
-                    icon: L.divIcon({
-                        html: '<div style="width: 20px; height: 20px; background: #34a853; border-radius: 50%; display: flex; align-items: center; justify-content: center; color: white; font-weight: bold; font-size: 12px;">A</div>',
-                        iconSize: [26, 26], iconAnchor: [13, 13]
-                    })
-                }).addTo(map);
-                startMarker.bindPopup("🚩 Origin").openPopup();
-                document.getElementById('startCoords').textContent = `${lat.toFixed(5)}, ${lng.toFixed(5)}`;
-            } else if (!endp) {
-                if (endMarker) map.removeLayer(endMarker);
-                endp = [lng, lat];
-                endMarker = L.marker([lat, lng], {
-                    icon: L.divIcon({
-                        html: '<div style="width: 20px; height: 20px; background: #ea4335; border-radius: 50%; display: flex; align-items: center; justify-content: center; color: white; font-weight: bold; font-size: 12px;">B</div>',
-                        iconSize: [26, 26], iconAnchor: [13, 13]
-                    })
-                }).addTo(map);
-                endMarker.bindPopup("🎯 Destination").openPopup();
-                document.getElementById('endCoords').textContent = `${lat.toFixed(5)}, ${lng.toFixed(5)}`;
-                document.getElementById('findRoutesBtn').disabled = false;
-            } else {
-                clearAll();
-                map.fire('click', e);
-            }
-        });
-        
-        document.getElementById('clearBtn').onclick = clearAll;
-        document.getElementById('findRoutesBtn').onclick = findRoutes;
-        
-        function clearAll() {
-            if (startMarker) { map.removeLayer(startMarker); startMarker = null; }
-            if (endMarker) { map.removeLayer(endMarker); endMarker = null; }
-            start = null; endp = null; routeLayers.clearLayers(); currentRoutes = [];
-            document.getElementById('startCoords').textContent = 'Click map';
-            document.getElementById('endCoords').textContent = 'Click map';
-            document.getElementById('findRoutesBtn').disabled = true;
-            document.getElementById('results').innerHTML = '';
-        }
-        
-        function showSpinner(show) {
-            document.getElementById('spinner').style.display = show ? 'block' : 'none';
-            document.getElementById('findRoutesBtn').disabled = show;
-            document.getElementById('findRoutesBtn').innerHTML = show ? '⏳ Analyzing Routes...' : '🔍 Find Enhanced Routes';
-        }
-        
-        async function findRoutes() {
-            if (!start || !endp) return;
-            
-            showSpinner(true);
-            routeLayers.clearLayers();
-            
-            const depTime = document.getElementById('departureTime').value;
-            let departure = 'now';
-            if (depTime === 'custom') {
-                const customTime = document.getElementById('customTime').value;
-                if (customTime) departure = Math.floor(new Date(customTime).getTime() / 1000);
-            }
-            
-            try {
-                const params = new URLSearchParams({
-                    start_lon: start[0], start_lat: start[1],
-                    end_lon: endp[0], end_lat: endp[1],
-                    departure_time: departure
-                });
-                
-                const response = await fetch('/api/analyze?' + params.toString());
-                const data = await response.json();
-                
-                showSpinner(false);
-                
-                if (!response.ok) {
-                    document.getElementById('results').innerHTML = 
-                        `<div class="error">Analysis failed: ${data.detail || 'Unknown error'}</div>`;
-                    return;
-                }
-                
-                currentRoutes = data.routes;
-                displayResults(data);
-                if (currentRoutes.length > 0) selectRoute(0);
-                
-            } catch (error) {
-                console.error('Error:', error);
-                showSpinner(false);
-                document.getElementById('results').innerHTML = 
-                    `<div class="error">Request failed: ${error.message}</div>`;
-            }
-        }
-        
-        function displayResults(data) {
-            let html = `<h3>🚴‍♂️🚌 Found ${data.routes.length} Enhanced Routes</h3>`;
-            
-            if (data.realtime_enabled) {
-                html += `<div style="background:#e3f2fd;padding:8px;border-radius:6px;margin:8px 0;font-size:0.9em;">
-                    🔴 Real-time departures included with color-coded routes
-                </div>`;
-            }
-            
-            data.routes.forEach((route, index) => {
-                html += createEnhancedRouteCard(route, index);
-            });
-            
-            document.getElementById('results').innerHTML = html;
-        }
-        
-        function createEnhancedRouteCard(route, index) {
-            const typeIcons = {
-                'bike_bus_bike': '🚴‍♂️🚌🚴‍♀️',
-                'direct_bike': '🚴‍♂️🚴‍♀️',
-                'transit_fallback': '🚶‍♂️🚌🚶‍♀️'
-            };
-            
-            let html = `
-                <div class="route-card" onclick="selectRoute(${index})" id="routeCard${index}">
-                    <div class="route-header">
-                        <div class="route-name">${typeIcons[route.type] || '🚴‍♂️'} ${route.name}</div>
-                        <div class="realtime-badge-small">ENHANCED</div>
-                    </div>
-                    
-                    <div class="route-metrics">
-                        <div class="metric">
-                            <div class="metric-value">${route.summary.total_time_formatted}</div>
-                            <div class="metric-label">Time</div>
-                        </div>
-                        <div class="metric">
-                            <div class="metric-value">${route.summary.total_distance_miles.toFixed(1)} mi</div>
-                            <div class="metric-label">Distance</div>
-                        </div>
-                        <div class="metric">
-                            <div class="metric-value">${route.summary.average_bike_score || 0}</div>
-                            <div class="metric-label">Bike Score</div>
-                        </div>
-                    </div>
-            `;
-            
-            // Add enhanced transit data if available
-            route.legs.forEach(leg => {
-                if (leg.type === 'transit' && leg.route.steps) {
-                    leg.route.steps.forEach(step => {
-                        if (step.travel_mode === 'TRANSIT' && step.enhanced_gtfs_data) {
-                            const gtfs = step.enhanced_gtfs_data;
-                            html += `
-                                <div class="enhanced-schedules">
-                                    <h4>🔴 ${step.departure_stop_name} - Live Departures:</h4>
-                                    <div class="realtime-departures">
-                            `;
-                            
-                            gtfs.realtime_departures.slice(0, 4).forEach(departure => {
-                                const statusClass = departure.delay_minutes > 5 ? 'status-late' : 
-                                                  departure.delay_minutes > 0 ? 'status-delayed' : 'status-ontime';
-                                
-                                html += `
-                                    <div class="departure-item">
-                                        <span class="departure-time-realtime">${departure.realtime_departure}</span>
-                                        <span class="departure-status ${statusClass}">${departure.status_text}</span>
-                                    </div>
-                                `;
-                            });
-                            
-                            html += `
-                                    </div>
-                                    <small>🔄 ${gtfs.total_departures} departures • Updated: ${gtfs.last_updated}</small>
-                                </div>
-                            `;
-                        }
-                    });
-                }
-            });
-            
-            html += `</div>`;
-            return html;
-        }
-        
-        function selectRoute(index) {
-            console.log('=== Selecting Route', index, '===');
-            document.querySelectorAll('.route-card').forEach(card => card.classList.remove('selected'));
-            const card = document.getElementById(`routeCard${index}`);
-            if (card) card.classList.add('selected');
-            
-            routeLayers.clearLayers();
-            const route = currentRoutes[index];
-            console.log('Route data:', route);
-            console.log('Number of legs:', route.legs?.length);
-            
-            // Visualize each leg with distinct colors
-            route.legs.forEach((leg, legIndex) => {
-                console.log(`Processing leg ${legIndex}:`, leg.name, 'Type:', leg.type);
-                visualizeLeg(leg, legIndex);
-            });
-            
-            // Add transit stops if bike-bus-bike route
-            if (route.type === 'bike_bus_bike') {
-                console.log('Adding transit stops for bike-bus-bike route');
-                addTransitStopsToMap(route);
-            }
-            
-            // Fit map to show the route
-            try {
-                const layerCount = routeLayers.getLayers().length;
-                console.log('Total layers added:', layerCount);
-                
-                if (layerCount > 0) {
-                    map.fitBounds(routeLayers.getBounds(), { padding: [20, 20] });
-                } else {
-                    console.warn('No layers were added to the map');
-                }
-            } catch (e) {
-                console.warn('Could not fit bounds:', e);
-            }
-        }
-        
-        function visualizeLeg(leg, legIndex) {
-            if (!leg.route || !leg.route.geometry || !leg.route.geometry.coordinates) return;
-            
-            const coords = leg.route.geometry.coordinates.map(coord => [coord[1], coord[0]]);
-            const color = routeColors[leg.type] || '#95a5a6';
-            
-            const polylineOptions = {
-                color: color,
-                weight: leg.type === 'bike' ? 6 : 5,
-                opacity: 0.8,
-                dashArray: leg.type === 'transit' ? '10, 5' : null
-            };
-            
-            const routeLine = L.polyline(coords, polylineOptions).addTo(routeLayers);
-            
-            // Enhanced popup with route details
-            const popupContent = `
-                <div style="font-family: 'Segoe UI', sans-serif;">
-                    <h4 style="margin: 0 0 10px 0; color: ${color};">
-                        ${leg.type === 'bike' ? '🚴‍♂️' : '🚌'} ${leg.name}
-                    </h4>
-                    <p style="margin: 5px 0;"><strong>Distance:</strong> ${leg.route.length_miles?.toFixed(2) || leg.route.distance_miles?.toFixed(2) || 'N/A'} miles</p>
-                    <p style="margin: 5px 0;"><strong>Time:</strong> ${leg.route.travel_time_formatted || leg.route.duration_text || 'N/A'}</p>
-                    ${leg.type === 'bike' ? 
-                        `<p style="margin: 5px 0;"><strong>OSRM Route Score:</strong> ${leg.route.overall_score || 'N/A'}</p>` : 
-                        `<p style="margin: 5px 0;"><strong>Transit Type:</strong> Google Maps + Real-time</p>`
-                    }
-                </div>
-            `;
-            
-            routeLine.bindPopup(popupContent);
-        }
-        
-        function addTransitStopsToMap(route) {
-            const transitLeg = route.legs.find(leg => leg.type === 'transit');
-            if (!transitLeg || !transitLeg.route) return;
-            
-            // Add start and end transit stops
-            if (transitLeg.route.start_stop) {
-                const stop = transitLeg.route.start_stop;
-                const icon = L.divIcon({
-                    html: '<div style="width: 24px; height: 24px; background: #8B4513; border: 3px solid white; border-radius: 50%; display: flex; align-items: center; justify-content: center; color: white; font-size: 12px; font-weight: bold;">🚌</div>',
-                    className: 'transit-stop-icon',
-                    iconSize: [30, 30],
-                    iconAnchor: [15, 15]
-                });
-                
-                L.marker([stop.display_y, stop.display_x], { icon })
-                    .addTo(routeLayers)
-                    .bindPopup(`<h5>🚏 Start Transit Stop</h5><p><strong>${stop.name}</strong></p>`);
-            }
-            
-            if (transitLeg.route.end_stop) {
-                const stop = transitLeg.route.end_stop;
-                const icon = L.divIcon({
-                    html: '<div style="width: 24px; height: 24px; background: #8B4513; border: 3px solid white; border-radius: 50%; display: flex; align-items: center; justify-content: center; color: white; font-size: 12px; font-weight: bold;">🚌</div>',
-                    className: 'transit-stop-icon',
-                    iconSize: [30, 30],
-                    iconAnchor: [15, 15]
-                });
-                
-                L.marker([stop.display_y, stop.display_x], { icon })
-                    .addTo(routeLayers)
-                    .bindPopup(`<h5>🚏 End Transit Stop</h5><p><strong>${stop.name}</strong></p>`);
-            }
-        }
-        
-        // Initialize
-        window.selectRoute = selectRoute;
-    </script>
-</body>
-</html>"""
-
-@app.get("/api/health")
-async def health():
-    status = {
-        "status": "healthy",
-        "google_key_present": bool(GOOGLE_API_KEY),
-        "osrm_server": OSRM_SERVER,
-        "bike_speed_mph": BIKE_SPEED_MPH,
-        "realtime_enabled": True,
-        "enhanced_frontend": True,
-        "time": datetime.datetime.now().isoformat()
-    }
-    try:
-        requests.get(f"{OSRM_SERVER}/health", timeout=5)
-        status["osrm_reachable"] = True
-    except Exception:
-        status["osrm_reachable"] = False
-    return status
-
-@app.get("/api/analyze")
-async def api_analyze(
-    start_lon: float = Query(...),
-    start_lat: float = Query(...),
-    end_lon: float = Query(...),
-    end_lat: float = Query(...),
-    departure_time: str = Query("now")
-):
-    if not (-180 <= start_lon <= 180 and -90 <= start_lat <= 90):
-        raise HTTPException(status_code=400, detail="Invalid start coordinates")
-    if not (-180 <= end_lon <= 180 and -90 <= end_lat <= 90):
-        raise HTTPException(status_code=400, detail="Invalid end coordinates")
-    
-    try:
-        return analyze_complete_bike_bus_bike_routes([start_lon, start_lat], [end_lon, end_lat], departure_time)
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"/api/analyze error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-if __name__ == "__main__":
-    port = int(os.getenv("PORT", "8000"))
-    uvicorn.run(app, host="0.0.0.0", port=port, reload=False, log_level="info")
+            "
