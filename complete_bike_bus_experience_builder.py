@@ -1,6 +1,6 @@
 # enhanced_osrm_google_transit_with_geopandas.py
 # Complete FastAPI app with GeoPandas-based enhanced bike routing analysis
-# Optimized for Railway deployment with Git LFS support for large shapefiles
+# Error-corrected version for Railway deployment
 
 import os
 import json
@@ -11,6 +11,7 @@ import math
 import sys
 import zipfile
 import numpy as np
+import re
 from typing import List, Dict, Optional, Tuple
 from fastapi import FastAPI, Query, HTTPException, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -555,6 +556,60 @@ class EnhancedBikeRouter:
             logger.error(f"Analysis error: {e}")
             return [], 50.0, {"ANALYSIS ERROR": {"length_miles": 0.0, "percentage": 100.0, "avg_score": 0.0}}
 
+    def find_nearby_transit_stops(self, lat: float, lon: float, radius_km: float = 0.5) -> List[Dict]:
+        """Find nearby transit stops using GeoPandas"""
+        if not self.geopandas_enabled or self.transit_stops_gdf is None:
+            return []
+        
+        try:
+            point = Point(lon, lat)
+            point_gdf = gpd.GeoDataFrame([1], geometry=[point], crs="EPSG:4326")
+            
+            # Convert to meters for accurate distance calculation
+            point_m = self._to_meters(point_gdf)
+            stops_m = self._to_meters(self.transit_stops_gdf)
+            
+            if point_m is None or stops_m is None:
+                return []
+            
+            # Calculate distances
+            distances = stops_m.geometry.distance(point_m.geometry.iloc[0])
+            radius_m = radius_km * 1000
+            
+            # Filter by radius
+            nearby_mask = distances <= radius_m
+            nearby_stops = self.transit_stops_gdf[nearby_mask].copy()
+            nearby_stops['distance_m'] = distances[nearby_mask]
+            
+            # Sort by distance
+            nearby_stops = nearby_stops.sort_values('distance_m')
+            
+            # Extract stop information
+            stops = []
+            for idx, stop in nearby_stops.head(5).iterrows():
+                geom = stop.geometry
+                if geom is None:
+                    continue
+                    
+                # Try to find name field
+                name_field = _map_field(stop.index, ["stop_name", "name", "NAME", "Stop_Name"])
+                stop_name = stop[name_field] if name_field else f"Transit Stop {idx}"
+                
+                stops.append({
+                    "id": str(idx),
+                    "name": str(stop_name),
+                    "lat": geom.y,
+                    "lon": geom.x,
+                    "distance_m": round(stop['distance_m'], 1),
+                    "distance_km": round(stop['distance_m'] / 1000, 3)
+                })
+            
+            return stops
+            
+        except Exception as e:
+            logger.error(f"Error finding nearby transit stops: {e}")
+            return []
+
 # Create global router instance
 enhanced_router = EnhancedBikeRouter()
 
@@ -630,7 +685,7 @@ def calculate_bike_route_enhanced(start_coords: List[float], end_coords: List[fl
         return None
 
 # =============================================================================
-# GOOGLE TRANSIT FUNCTIONS (unchanged from your original)
+# GOOGLE TRANSIT FUNCTIONS
 # =============================================================================
 
 def get_transit_routes_google(origin: Tuple[float, float], destination: Tuple[float, float], departure_time: str = "now", max_alternatives: int = 3) -> Dict:
@@ -712,4 +767,854 @@ def parse_google_transit_route_enhanced(route_data: Dict, route_index: int) -> O
             "service": "Google Maps Transit",
             "route_type": "transit",
             "realtime_enhanced": True,
-            "
+            "enhancement_timestamp": datetime.datetime.now().isoformat()
+        }
+        
+        return enhanced_route
+    except Exception as e:
+        logger.error(f"Transit route parsing error: {e}")
+        return None
+
+def parse_transit_step_enhanced(step: Dict, step_index: int) -> Optional[Dict]:
+    try:
+        mode = step.get("travel_mode", "UNKNOWN")
+        
+        # Clean HTML from instructions
+        instruction = step.get("html_instructions", "")
+        instruction = re.sub(r'<[^>]*>', '', instruction)
+        
+        dur_s = step.get("duration", {}).get("value", 0)
+        dur_min = round(dur_s / 60.0, 1)
+        dist_m = step.get("distance", {}).get("value", 0)
+        dist_mi = round(dist_m * 0.000621371, 2)
+
+        step_data = {
+            "step_number": step_index + 1,
+            "travel_mode": mode,
+            "instruction": instruction,
+            "duration_seconds": dur_s,
+            "duration_minutes": dur_min,
+            "duration_text": format_time_duration(dur_min),
+            "distance_meters": dist_m,
+            "distance_miles": dist_mi
+        }
+
+        if mode == "TRANSIT" and "transit_details" in step:
+            transit = step["transit_details"]
+            line = transit.get("line", {})
+            vehicle = line.get("vehicle", {})
+            agencies = line.get("agencies", [])
+
+            step_data.update({
+                "transit_line": line.get("short_name", line.get("name", "Unknown Line")),
+                "transit_line_color": line.get("color", "#1f8dd6"),
+                "transit_vehicle_type": vehicle.get("type", "BUS"),
+                "transit_vehicle_name": vehicle.get("name", "Bus"),
+                "transit_agency": agencies[0].get("name", "Transit Agency") if agencies else "Transit Agency"
+            })
+
+            departure_stop = transit.get("departure_stop", {})
+            arrival_stop = transit.get("arrival_stop", {})
+
+            step_data.update({
+                "departure_stop_name": departure_stop.get("name", "Unknown Stop"),
+                "departure_stop_location": departure_stop.get("location", {}),
+                "arrival_stop_name": arrival_stop.get("name", "Unknown Stop"),
+                "arrival_stop_location": arrival_stop.get("location", {}),
+                "num_stops": transit.get("num_stops", 0)
+            })
+
+            departure_time = transit.get("departure_time", {})
+            arrival_time = transit.get("arrival_time", {})
+
+            step_data.update({
+                "scheduled_departure": parse_epoch_to_hhmm(departure_time.get("value")),
+                "scheduled_arrival": parse_epoch_to_hhmm(arrival_time.get("value")),
+                "departure_timestamp": departure_time.get("value", 0),
+                "arrival_timestamp": arrival_time.get("value", 0)
+            })
+
+            step_data["headsign"] = transit.get("headsign", "")
+
+            if "fare" in line:
+                fare = line["fare"]
+                step_data.update({
+                    "fare_text": fare.get("text", ""),
+                    "fare_value": fare.get("value", 0),
+                    "fare_currency": fare.get("currency", "USD")
+                })
+
+        return step_data
+    except Exception as e:
+        logger.error(f"Transit step parsing error: {e}")
+        return None
+
+# =============================================================================
+# BIKE-BUS-BIKE ROUTE ANALYSIS
+# =============================================================================
+
+def analyze_bike_bus_bike_routes(start_coords: List[float], end_coords: List[float], departure_time: str = "now"):
+    """Main function to analyze bike-bus-bike routes"""
+    try:
+        logger.info(f"Analyzing bike-bus-bike routes from {start_coords} to {end_coords}")
+        
+        # Find nearby transit stops for start and end points
+        start_stops = enhanced_router.find_nearby_transit_stops(start_coords[1], start_coords[0], radius_km=0.8)
+        end_stops = enhanced_router.find_nearby_transit_stops(end_coords[1], end_coords[0], radius_km=0.8)
+        
+        if not start_stops or not end_stops:
+            # Fall back to Google Places API if no local transit data
+            start_stops = find_nearby_transit_google(start_coords[1], start_coords[0])
+            end_stops = find_nearby_transit_google(end_coords[1], end_coords[0])
+        
+        if not start_stops:
+            return {"error": "No transit stops found near start location"}
+        if not end_stops:
+            return {"error": "No transit stops found near end location"}
+
+        # Use the closest stops
+        start_stop = start_stops[0]
+        end_stop = end_stops[0]
+        
+        # Ensure we have different stops
+        if start_stop["id"] == end_stop["id"]:
+            if len(start_stops) > 1:
+                end_stop = start_stops[1]
+            elif len(end_stops) > 1:
+                end_stop = end_stops[1]
+            else:
+                return {"error": "Only one transit stop found - not suitable for multimodal routing"}
+
+        # Create bike legs
+        bike_leg_1 = calculate_bike_route_enhanced(start_coords, [start_stop["lon"], start_stop["lat"]], "Bike to Transit")
+        bike_leg_2 = calculate_bike_route_enhanced([end_stop["lon"], end_stop["lat"]], end_coords, "Transit to Destination")
+        
+        if not bike_leg_1:
+            return {"error": "Could not create bike route to transit stop"}
+        if not bike_leg_2:
+            return {"error": "Could not create bike route from transit stop"}
+
+        # Get transit options
+        transit_result = get_transit_routes_google(
+            (start_stop["lon"], start_stop["lat"]), 
+            (end_stop["lon"], end_stop["lat"]), 
+            departure_time
+        )
+        
+        if "error" in transit_result:
+            transit_routes = []
+        else:
+            transit_routes = transit_result.get("routes", [])
+
+        # Create complete multimodal routes
+        complete_routes = []
+        for i, transit_route in enumerate(transit_routes):
+            total_time = (bike_leg_1["travel_time_minutes"] + 
+                         transit_route["duration_minutes"] + 
+                         bike_leg_2["travel_time_minutes"] + 
+                         5)  # Add 5 minutes for transfers/boarding
+            
+            total_distance = (bike_leg_1["length_miles"] + 
+                            transit_route["distance_miles"] + 
+                            bike_leg_2["length_miles"])
+            
+            bike_distance = bike_leg_1["length_miles"] + bike_leg_2["length_miles"]
+            
+            # Calculate weighted bike safety score
+            total_bike_length = bike_leg_1["length_miles"] + bike_leg_2["length_miles"]
+            if total_bike_length > 0:
+                weighted_score = ((bike_leg_1["overall_score"] * bike_leg_1["length_miles"]) +
+                                (bike_leg_2["overall_score"] * bike_leg_2["length_miles"])) / total_bike_length
+            else:
+                weighted_score = 0
+
+            complete_route = {
+                "id": i + 1,
+                "name": f"Bike-Bus-Bike Option {i + 1}",
+                "type": "multimodal",
+                "summary": {
+                    "total_time_minutes": round(total_time, 1),
+                    "total_time_formatted": format_time_duration(total_time),
+                    "total_distance_miles": round(total_distance, 2),
+                    "bike_distance_miles": round(bike_distance, 2),
+                    "transit_distance_miles": round(transit_route["distance_miles"], 2),
+                    "bike_percentage": round((bike_distance / total_distance) * 100, 1) if total_distance > 0 else 0,
+                    "average_bike_score": round(weighted_score, 1),
+                    "transfers": transit_route.get("transfers", 0),
+                    "departure_time": transit_route.get("departure_time", "Unknown"),
+                    "arrival_time": transit_route.get("arrival_time", "Unknown")
+                },
+                "legs": [
+                    {
+                        "type": "bike",
+                        "name": "Bike to Transit",
+                        "route": bike_leg_1,
+                        "order": 1
+                    },
+                    {
+                        "type": "transit",
+                        "name": f"Transit Route {i + 1}",
+                        "route": transit_route,
+                        "start_stop": start_stop,
+                        "end_stop": end_stop,
+                        "order": 2
+                    },
+                    {
+                        "type": "bike",
+                        "name": "Transit to Destination",
+                        "route": bike_leg_2,
+                        "order": 3
+                    }
+                ]
+            }
+            complete_routes.append(complete_route)
+
+        # Add direct bike route for comparison
+        direct_bike_route = calculate_bike_route_enhanced(start_coords, end_coords, "Direct Bike Route")
+        if direct_bike_route:
+            direct_route = {
+                "id": len(complete_routes) + 1,
+                "name": "Direct Bike Route",
+                "type": "direct_bike",
+                "summary": {
+                    "total_time_minutes": direct_bike_route["travel_time_minutes"],
+                    "total_time_formatted": direct_bike_route["travel_time_formatted"],
+                    "total_distance_miles": direct_bike_route["length_miles"],
+                    "bike_distance_miles": direct_bike_route["length_miles"],
+                    "transit_distance_miles": 0,
+                    "bike_percentage": 100,
+                    "average_bike_score": direct_bike_route["overall_score"],
+                    "transfers": 0,
+                    "departure_time": "Immediate",
+                    "arrival_time": "Flexible"
+                },
+                "legs": [
+                    {
+                        "type": "bike",
+                        "name": "Direct Bike Route",
+                        "route": direct_bike_route,
+                        "order": 1
+                    }
+                ]
+            }
+            complete_routes.append(direct_route)
+
+        # Sort by total time
+        complete_routes.sort(key=lambda x: x["summary"]["total_time_minutes"])
+
+        result = {
+            "success": True,
+            "analysis_type": "bike_bus_bike",
+            "routes": complete_routes,
+            "transit_stops": {
+                "start_stop": start_stop,
+                "end_stop": end_stop,
+                "all_start_stops": start_stops[:3],
+                "all_end_stops": end_stops[:3]
+            },
+            "statistics": {
+                "total_options": len(complete_routes),
+                "multimodal_options": len([r for r in complete_routes if r["type"] == "multimodal"]),
+                "direct_bike_options": len([r for r in complete_routes if r["type"] == "direct_bike"]),
+                "fastest_option": complete_routes[0]["name"] if complete_routes else None,
+                "fastest_time": complete_routes[0]["summary"]["total_time_formatted"] if complete_routes else None
+            },
+            "bike_speed_mph": BIKE_SPEED_MPH,
+            "analysis_timestamp": datetime.datetime.now().isoformat()
+        }
+
+        return result
+
+    except Exception as e:
+        logger.error(f"Bike-bus-bike analysis error: {e}")
+        return {"error": str(e)}
+
+def find_nearby_transit_google(lat: float, lon: float, radius_m: int = 500) -> List[Dict]:
+    """Find nearby transit stops using Google Places API as fallback"""
+    require_google_key()
+    try:
+        params = {
+            "location": f"{lat},{lon}",
+            "radius": radius_m,
+            "type": "transit_station",
+            "key": GOOGLE_API_KEY
+        }
+        
+        r = requests.get(GMAPS_PLACES_NEARBY_URL, params=params, timeout=30)
+        data = r.json()
+        
+        if data.get("status") != "OK":
+            return []
+        
+        stops = []
+        for i, place in enumerate(data.get("results", [])[:5]):
+            location = place.get("geometry", {}).get("location", {})
+            stops.append({
+                "id": f"google_{place.get('place_id', i)}",
+                "name": place.get("name", f"Transit Stop {i+1}"),
+                "lat": location.get("lat", lat),
+                "lon": location.get("lng", lon),
+                "distance_m": 0,  # Google doesn't provide exact distance
+                "distance_km": 0,
+                "source": "google_places"
+            })
+        
+        return stops
+    except Exception as e:
+        logger.error(f"Google Places transit search error: {e}")
+        return []
+
+# =============================================================================
+# API ENDPOINTS
+# =============================================================================
+
+@app.get("/", response_class=HTMLResponse)
+async def root():
+    """Main page with interactive map"""
+    return """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Enhanced Bike-Bus-Bike Route Planner</title>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+        <style>
+            body { margin: 0; padding: 0; font-family: 'Segoe UI', sans-serif; }
+            .header {
+                background: linear-gradient(135deg, #2c3e50, #3498db);
+                color: white; padding: 20px; text-align: center;
+            }
+            .container { display: flex; height: calc(100vh - 80px); }
+            #map { flex: 2; }
+            #sidebar { flex: 1; padding: 20px; overflow-y: auto; background: #f8f9fa; }
+            .controls { margin-bottom: 20px; }
+            .form-group { margin-bottom: 15px; }
+            label { display: block; margin-bottom: 5px; font-weight: bold; }
+            input, select, button {
+                width: 100%; padding: 8px; border: 1px solid #ddd;
+                border-radius: 4px; font-size: 14px;
+            }
+            button { background: #3498db; color: white; border: none; cursor: pointer; }
+            button:hover { background: #2980b9; }
+            button:disabled { background: #bdc3c7; cursor: not-allowed; }
+            .route-card {
+                background: white; border-radius: 8px; padding: 15px;
+                margin-bottom: 15px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+                cursor: pointer; border: 2px solid transparent;
+            }
+            .route-card:hover { border-color: #3498db; }
+            .route-card.selected { border-color: #2ecc71; background: #f8fff8; }
+            .route-name { font-weight: bold; color: #2c3e50; margin-bottom: 10px; }
+            .route-summary { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+            .summary-item { text-align: center; }
+            .summary-value { font-weight: bold; color: #3498db; }
+            .summary-label { font-size: 12px; color: #7f8c8d; }
+            .legs { margin-top: 15px; }
+            .leg { margin: 8px 0; padding: 8px; border-left: 4px solid #bdc3c7; }
+            .leg.bike { border-left-color: #27ae60; background: #f8fff8; }
+            .leg.transit { border-left-color: #3498db; background: #f8fbff; }
+            .error { color: #e74c3c; padding: 10px; background: #fdf2f2; border-radius: 4px; }
+            .loading { text-align: center; color: #7f8c8d; }
+        </style>
+    </head>
+    <body>
+        <div class="header">
+            <h1>🚴‍♂️🚌🚴‍♀️ Enhanced Bike-Bus-Bike Route Planner</h1>
+            <p>Advanced multimodal routing with GeoPandas-powered bicycle infrastructure analysis</p>
+        </div>
+        
+        <div class="container">
+            <div id="map"></div>
+            <div id="sidebar">
+                <div class="controls">
+                    <h3>📍 Route Planning</h3>
+                    <p><strong>Instructions:</strong> Click the map to set start (green) and end (red) points, then find routes!</p>
+                    
+                    <div class="form-group">
+                        <label>🕐 Departure Time:</label>
+                        <select id="departureTime">
+                            <option value="now">Leave Now</option>
+                            <option value="custom">Custom Time</option>
+                        </select>
+                    </div>
+                    
+                    <div class="form-group" id="customTimeGroup" style="display: none;">
+                        <input type="datetime-local" id="customTime">
+                    </div>
+                    
+                    <button id="findRoutesBtn" disabled>🔍 Find Bike-Bus-Bike Routes</button>
+                    <button onclick="clearAll()">🗑️ Clear All</button>
+                    
+                    <div id="coordinates" style="font-size: 12px; margin-top: 10px; color: #666;"></div>
+                </div>
+                
+                <div id="results"></div>
+            </div>
+        </div>
+
+        <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+        <script>
+            let map, startPoint = null, endPoint = null;
+            let startMarker = null, endMarker = null, routeLayersGroup;
+            let currentRoutes = [];
+
+            function initMap() {
+                map = L.map('map').setView([30.3322, -81.6557], 12);
+                L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                    attribution: '© OpenStreetMap contributors'
+                }).addTo(map);
+                
+                routeLayersGroup = L.layerGroup().addTo(map);
+                
+                map.on('click', function(e) {
+                    if (!startPoint) {
+                        startPoint = e.latlng;
+                        if (startMarker) map.removeLayer(startMarker);
+                        startMarker = L.marker(startPoint, {
+                            icon: L.icon({
+                                iconUrl: 'https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-green.png',
+                                shadowUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/0.7.7/images/marker-shadow.png',
+                                iconSize: [25, 41], iconAnchor: [12, 41]
+                            })
+                        }).addTo(map);
+                        updateCoordinates();
+                    } else if (!endPoint) {
+                        endPoint = e.latlng;
+                        if (endMarker) map.removeLayer(endMarker);
+                        endMarker = L.marker(endPoint, {
+                            icon: L.icon({
+                                iconUrl: 'https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-red.png',
+                                shadowUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/0.7.7/images/marker-shadow.png',
+                                iconSize: [25, 41], iconAnchor: [12, 41]
+                            })
+                        }).addTo(map);
+                        updateCoordinates();
+                    } else {
+                        clearAll();
+                        map.fire('click', e);
+                    }
+                });
+            }
+
+            function updateCoordinates() {
+                const coords = document.getElementById('coordinates');
+                let text = '';
+                if (startPoint) text += `Start: ${startPoint.lat.toFixed(5)}, ${startPoint.lng.toFixed(5)}\\n`;
+                if (endPoint) text += `End: ${endPoint.lat.toFixed(5)}, ${endPoint.lng.toFixed(5)}`;
+                coords.textContent = text;
+                
+                document.getElementById('findRoutesBtn').disabled = !(startPoint && endPoint);
+            }
+
+            function clearAll() {
+                startPoint = null; endPoint = null;
+                if (startMarker) { map.removeLayer(startMarker); startMarker = null; }
+                if (endMarker) { map.removeLayer(endMarker); endMarker = null; }
+                routeLayersGroup.clearLayers();
+                document.getElementById('results').innerHTML = '';
+                updateCoordinates();
+                currentRoutes = [];
+            }
+
+            async function findRoutes() {
+                if (!startPoint || !endPoint) return;
+                
+                const results = document.getElementById('results');
+                results.innerHTML = '<div class="loading">🔄 Analyzing bike-bus-bike routes...</div>';
+                
+                try {
+                    const departureTime = document.getElementById('departureTime').value;
+                    let timeParam = 'now';
+                    
+                    if (departureTime === 'custom') {
+                        const customTime = document.getElementById('customTime').value;
+                        if (customTime) {
+                            timeParam = Math.floor(new Date(customTime).getTime() / 1000);
+                        }
+                    }
+                    
+                    const response = await fetch(`/analyze-bike-bus-bike?start_lon=${startPoint.lng}&start_lat=${startPoint.lat}&end_lon=${endPoint.lng}&end_lat=${endPoint.lat}&departure_time=${timeParam}`);
+                    const data = await response.json();
+                    
+                    if (data.error) {
+                        results.innerHTML = `<div class="error">❌ ${data.error}</div>`;
+                        return;
+                    }
+                    
+                    displayResults(data);
+                    
+                } catch (error) {
+                    results.innerHTML = `<div class="error">❌ Error: ${error.message}</div>`;
+                }
+            }
+
+            function displayResults(data) {
+                currentRoutes = data.routes || [];
+                const results = document.getElementById('results');
+                
+                if (currentRoutes.length === 0) {
+                    results.innerHTML = '<div class="error">❌ No routes found</div>';
+                    return;
+                }
+                
+                let html = `<h3>🛣️ Found ${currentRoutes.length} Route Options</h3>`;
+                
+                currentRoutes.forEach((route, index) => {
+                    const typeIcon = route.type === 'multimodal' ? '🚴‍♂️🚌🚴‍♀️' : '🚴‍♂️';
+                    const typeLabel = route.type === 'multimodal' ? 'Multimodal' : 'Direct Bike';
+                    
+                    html += `
+                        <div class="route-card" onclick="selectRoute(${index})">
+                            <div class="route-name">${typeIcon} ${route.name}</div>
+                            <div class="route-summary">
+                                <div class="summary-item">
+                                    <div class="summary-value">${route.summary.total_time_formatted}</div>
+                                    <div class="summary-label">Total Time</div>
+                                </div>
+                                <div class="summary-item">
+                                    <div class="summary-value">${route.summary.total_distance_miles.toFixed(1)} mi</div>
+                                    <div class="summary-label">Distance</div>
+                                </div>
+                                <div class="summary-item">
+                                    <div class="summary-value">${route.summary.bike_distance_miles.toFixed(1)} mi</div>
+                                    <div class="summary-label">Bike Distance</div>
+                                </div>
+                                <div class="summary-item">
+                                    <div class="summary-value">${route.summary.average_bike_score}</div>
+                                    <div class="summary-label">Bike Safety</div>
+                                </div>
+                            </div>
+                            <div class="legs">
+                                ${route.legs.map(leg => `
+                                    <div class="leg ${leg.type}">
+                                        <strong>${leg.type === 'bike' ? '🚴‍♂️' : '🚌'} ${leg.name}</strong><br>
+                                        ${leg.route.length_miles?.toFixed(2) || leg.route.distance_miles?.toFixed(2) || '0'} mi • 
+                                        ${leg.route.travel_time_formatted || leg.route.duration_text || 'N/A'}
+                                        ${leg.type === 'bike' && leg.route.overall_score ? ` • Safety: ${leg.route.overall_score}` : ''}
+                                    </div>
+                                `).join('')}
+                            </div>
+                        </div>
+                    `;
+                });
+                
+                results.innerHTML = html;
+                
+                // Auto-select first route
+                if (currentRoutes.length > 0) {
+                    setTimeout(() => selectRoute(0), 500);
+                }
+            }
+
+            function selectRoute(index) {
+                // Update selection styling
+                document.querySelectorAll('.route-card').forEach((card, i) => {
+                    card.classList.toggle('selected', i === index);
+                });
+                
+                // Clear existing route layers
+                routeLayersGroup.clearLayers();
+                
+                const route = currentRoutes[index];
+                if (!route) return;
+                
+                // Display each leg
+                route.legs.forEach((leg, legIndex) => {
+                    displayLegOnMap(leg, legIndex);
+                });
+                
+                // Add transit stops for multimodal routes
+                if (route.type === 'multimodal') {
+                    const transitLeg = route.legs.find(leg => leg.type === 'transit');
+                    if (transitLeg && transitLeg.start_stop && transitLeg.end_stop) {
+                        // Start stop
+                        L.marker([transitLeg.start_stop.lat, transitLeg.start_stop.lon], {
+                            icon: L.divIcon({
+                                html: '🚌',
+                                iconSize: [20, 20],
+                                className: 'emoji-icon'
+                            })
+                        }).bindPopup(`<strong>🚌 ${transitLeg.start_stop.name}</strong>`).addTo(routeLayersGroup);
+                        
+                        // End stop
+                        L.marker([transitLeg.end_stop.lat, transitLeg.end_stop.lon], {
+                            icon: L.divIcon({
+                                html: '🚌',
+                                iconSize: [20, 20],
+                                className: 'emoji-icon'
+                            })
+                        }).bindPopup(`<strong>🚌 ${transitLeg.end_stop.name}</strong>`).addTo(routeLayersGroup);
+                    }
+                }
+                
+                // Fit map to show all layers
+                if (routeLayersGroup.getLayers().length > 0) {
+                    try {
+                        map.fitBounds(routeLayersGroup.getBounds(), {padding: [20, 20]});
+                    } catch (e) {
+                        console.warn('Could not fit bounds');
+                    }
+                }
+            }
+
+            function displayLegOnMap(leg, legIndex) {
+                const route = leg.route;
+                if (!route.geometry || !route.geometry.coordinates) return;
+                
+                const coords = route.geometry.coordinates.map(coord => [coord[1], coord[0]]);
+                const color = leg.type === 'bike' ? '#27ae60' : '#3498db';
+                
+                const polyline = L.polyline(coords, {
+                    color: color,
+                    weight: 6,
+                    opacity: 0.8
+                }).addTo(routeLayersGroup);
+                
+                polyline.bindPopup(`
+                    <strong>${leg.type === 'bike' ? '🚴‍♂️' : '🚌'} ${leg.name}</strong><br>
+                    Distance: ${route.length_miles?.toFixed(2) || route.distance_miles?.toFixed(2)} mi<br>
+                    Time: ${route.travel_time_formatted || route.duration_text}
+                    ${leg.type === 'bike' && route.overall_score ? `<br>Safety Score: ${route.overall_score}` : ''}
+                `);
+            }
+
+            // Event listeners
+            document.getElementById('departureTime').addEventListener('change', function() {
+                const customTimeGroup = document.getElementById('customTimeGroup');
+                if (this.value === 'custom') {
+                    customTimeGroup.style.display = 'block';
+                    const now = new Date();
+                    now.setMinutes(now.getMinutes() - now.getTimezoneOffset());
+                    document.getElementById('customTime').value = now.toISOString().slice(0, 16);
+                } else {
+                    customTimeGroup.style.display = 'none';
+                }
+            });
+
+            document.getElementById('findRoutesBtn').addEventListener('click', findRoutes);
+
+            // Initialize map
+            document.addEventListener('DOMContentLoaded', initMap);
+        </script>
+    </body>
+    </html>
+    """
+
+@app.get("/status")
+async def get_status():
+    """API status and configuration info"""
+    return {
+        "status": "operational",
+        "service": "Enhanced OSRM + Google Transit + GeoPandas Planner",
+        "version": "3.1.0",
+        "features": {
+            "geopandas_analysis": enhanced_router.geopandas_enabled,
+            "roads_data": enhanced_router.roads_gdf is not None,
+            "transit_stops_data": enhanced_router.transit_stops_gdf is not None,
+            "google_api": bool(GOOGLE_API_KEY),
+            "osrm_server": OSRM_SERVER
+        },
+        "configuration": {
+            "bike_speed_mph": BIKE_SPEED_MPH,
+            "use_osrm_duration": USE_OSRM_DURATION
+        },
+        "data_status": {
+            "roads_features": len(enhanced_router.roads_gdf) if enhanced_router.roads_gdf is not None else 0,
+            "transit_stops": len(enhanced_router.transit_stops_gdf) if enhanced_router.transit_stops_gdf is not None else 0
+        }
+    }
+
+@app.get("/bike-route")
+async def get_bike_route(
+    start_lon: float = Query(..., description="Start longitude"),
+    start_lat: float = Query(..., description="Start latitude"), 
+    end_lon: float = Query(..., description="End longitude"),
+    end_lat: float = Query(..., description="End latitude")
+):
+    """Get enhanced bicycle route with GeoPandas analysis"""
+    try:
+        route = calculate_bike_route_enhanced([start_lon, start_lat], [end_lon, end_lat])
+        if not route:
+            raise HTTPException(status_code=404, detail="No bike route found")
+        
+        return {
+            "success": True,
+            "route": route,
+            "analysis_timestamp": datetime.datetime.now().isoformat()
+        }
+    except Exception as e:
+        logger.error(f"Bike route endpoint error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/transit-routes")  
+async def get_transit_routes_endpoint(
+    start_lon: float = Query(..., description="Start longitude"),
+    start_lat: float = Query(..., description="Start latitude"),
+    end_lon: float = Query(..., description="End longitude"), 
+    end_lat: float = Query(..., description="End latitude"),
+    departure_time: str = Query("now", description="Departure time (epoch or 'now')")
+):
+    """Get transit routes using Google Maps API"""
+    try:
+        result = get_transit_routes_google(
+            (start_lon, start_lat), 
+            (end_lon, end_lat), 
+            departure_time
+        )
+        
+        if "error" in result:
+            raise HTTPException(status_code=404, detail=result["error"])
+            
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Transit routes endpoint error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/analyze-bike-bus-bike")
+async def analyze_bike_bus_bike_endpoint(
+    start_lon: float = Query(..., description="Start longitude"),
+    start_lat: float = Query(..., description="Start latitude"),
+    end_lon: float = Query(..., description="End longitude"),
+    end_lat: float = Query(..., description="End latitude"), 
+    departure_time: str = Query("now", description="Departure time (epoch or 'now')")
+):
+    """Complete bike-bus-bike route analysis"""
+    try:
+        result = analyze_bike_bus_bike_routes(
+            [start_lon, start_lat], 
+            [end_lon, end_lat], 
+            departure_time
+        )
+        
+        if "error" in result:
+            raise HTTPException(status_code=404, detail=result["error"])
+            
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Bike-bus-bike analysis endpoint error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/nearby-transit")
+async def get_nearby_transit_stops(
+    lat: float = Query(..., description="Latitude"),
+    lon: float = Query(..., description="Longitude"),
+    radius_km: float = Query(0.5, description="Search radius in kilometers")
+):
+    """Find nearby transit stops"""
+    try:
+        # Try GeoPandas first
+        stops = enhanced_router.find_nearby_transit_stops(lat, lon, radius_km)
+        
+        # Fall back to Google Places if no local data
+        if not stops:
+            stops = find_nearby_transit_google(lat, lon, int(radius_km * 1000))
+        
+        return {
+            "success": True,
+            "stops": stops,
+            "search_location": {"lat": lat, "lon": lon},
+            "search_radius_km": radius_km,
+            "found_count": len(stops)
+        }
+    except Exception as e:
+        logger.error(f"Nearby transit endpoint error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/upload-shapefile")
+async def upload_shapefile(
+    file: UploadFile = File(...),
+    shapefile_type: str = Query(..., description="'roads' or 'transit_stops'")
+):
+    """Upload and process shapefile data"""
+    try:
+        if not file.filename.endswith(('.zip', '.shp')):
+            raise HTTPException(status_code=400, detail="File must be .zip archive or .shp file")
+        
+        # Save uploaded file
+        upload_dir = "./uploads"
+        os.makedirs(upload_dir, exist_ok=True)
+        
+        file_path = os.path.join(upload_dir, file.filename)
+        with open(file_path, "wb") as buffer:
+            content = await file.read()
+            buffer.write(content)
+        
+        # Extract if it's a zip file
+        if file.filename.endswith('.zip'):
+            extract_if_archived(file_path, upload_dir)
+            
+            # Find the .shp file in extracted content
+            shp_files = []
+            for root, dirs, files in os.walk(upload_dir):
+                for f in files:
+                    if f.endswith('.shp'):
+                        shp_files.append(os.path.join(root, f))
+            
+            if not shp_files:
+                raise HTTPException(status_code=400, detail="No .shp file found in archive")
+            
+            file_path = shp_files[0]
+        
+        # Load the shapefile based on type
+        if shapefile_type == "roads":
+            if enhanced_router.geopandas_enabled:
+                enhanced_router.roads_gdf = gpd.read_file(file_path)
+                enhanced_router._standardize_roads_columns()
+                enhanced_router.roads_gdf_m = enhanced_router._to_meters(enhanced_router.roads_gdf)
+                logger.info(f"Loaded roads shapefile: {len(enhanced_router.roads_gdf)} features")
+            else:
+                raise HTTPException(status_code=500, detail="GeoPandas not available")
+                
+        elif shapefile_type == "transit_stops":
+            if enhanced_router.geopandas_enabled:
+                enhanced_router.transit_stops_gdf = gpd.read_file(file_path)
+                logger.info(f"Loaded transit stops shapefile: {len(enhanced_router.transit_stops_gdf)} features")
+            else:
+                raise HTTPException(status_code=500, detail="GeoPandas not available")
+        else:
+            raise HTTPException(status_code=400, detail="shapefile_type must be 'roads' or 'transit_stops'")
+        
+        return {
+            "success": True,
+            "message": f"Successfully loaded {shapefile_type} shapefile",
+            "features_count": len(enhanced_router.roads_gdf if shapefile_type == "roads" else enhanced_router.transit_stops_gdf),
+            "file_path": file_path
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Shapefile upload error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+if __name__ == "__main__":
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Enhanced OSRM + Google Transit + GeoPandas Planner")
+    parser.add_argument("--host", default="0.0.0.0", help="Host to bind to")
+    parser.add_argument("--port", type=int, default=8000, help="Port to bind to") 
+    parser.add_argument("--reload", action="store_true", help="Enable auto-reload")
+    
+    args = parser.parse_args()
+    
+    logger.info("🚴‍♂️🚌🚴‍♀️ Starting Enhanced Bike-Bus-Bike Route Planner")
+    logger.info(f"GeoPandas Available: {GEOPANDAS_AVAILABLE}")
+    logger.info(f"OSRM Server: {OSRM_SERVER}")
+    logger.info(f"Google API Key Configured: {bool(GOOGLE_API_KEY)}")
+    logger.info(f"Bike Speed: {BIKE_SPEED_MPH} mph")
+    
+    uvicorn.run(
+        "enhanced_osrm_google_transit_with_geopandas:app",
+        host=args.host,
+        port=args.port,
+        reload=args.reload
+    )
